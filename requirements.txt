@@ -1,0 +1,8 @@
+marimo
+numpy
+pandas
+matplotlib
+yfinance
+torch
+blitz-bayesian-pytorch
+ta
