@@ -98,8 +98,8 @@ def _():
     # Bayesian NN parameters
     HIDDEN_UNITS_1 = 64
     HIDDEN_UNITS_2 = 32
-    LEARNING_RATE = 0.008
-    EPOCHS = 220 # Reduced for quicker testing, you can increase it back
+    LEARNING_RATE = 0.009
+    EPOCHS = 200 # Reduced for quicker testing, you can increase it back
     # BATCH_SIZE = 128
     BATCH_SIZE = 256
     SAMPLE_NBR_ELBO = 5
