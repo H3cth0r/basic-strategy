@@ -136,6 +136,7 @@ def _(mo):
 def _(DATA_PERIOD, INTERVAL, TICKER, yf):
     data = yf.Ticker(TICKER).history(period=DATA_PERIOD, interval=INTERVAL, auto_adjust=True)
     data = data.drop(columns=['Dividends', 'Stock Splits'])
+    print(data.shape)
     data.head()
     return (data,)
 
@@ -165,6 +166,7 @@ def _(data_1):
     selected_features = ['Open', 'High', 'Low', 'Close', 'Volume', 'trend_sma_fast', 'trend_ema_fast', 'momentum_rsi', 'trend_macd_diff', 'volatility_bbh', 'volatility_bbl', 'volatility_atr', 'volume_obv']
     selected_features = [f for f in selected_features if f in data_1.columns]
     data_2 = data_1[selected_features]
+    print(data_2.shape)
     data_2.head()
     return (data_2,)
 

@@ -1,0 +1,6 @@
+{
+    "N_LAGS": 15,
+    "N_STEPS_AHEAD": 5,
+    "HIDDEN_UNITS_1": 64,
+    "HIDDEN_UNITS_2": 32
+}
