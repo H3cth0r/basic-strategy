@@ -98,8 +98,8 @@ def _():
     # Bayesian NN parameters
     HIDDEN_UNITS_1 = 64
     HIDDEN_UNITS_2 = 32
-    LEARNING_RATE = 0.009
-    EPOCHS = 200 # Reduced for quicker testing, you can increase it back
+    LEARNING_RATE = 0.006
+    EPOCHS = 240 # Reduced for quicker testing, you can increase it back
     # BATCH_SIZE = 128
     BATCH_SIZE = 256
     SAMPLE_NBR_ELBO = 5
@@ -692,11 +692,363 @@ def _(
         use_random_seed=True,
         export_prefix=f"{TICKER}_model"
     )
+    return (selected_features_list,)
+
+
+@app.cell
+def _():
+    """
+    results_eth = train_and_test(
+        ticker="ETH-USD",
+        period=DATA_PERIOD,
+        interval=INTERVAL,
+        base_features=selected_features_list,
+        n_lags=N_LAGS,
+        n_steps_ahead=N_STEPS_AHEAD,
+        test_size=TEST_SIZE,
+        seed=SEED,
+        shuffle_split=False,
+        hidden_units_1=HIDDEN_UNITS_1,
+        hidden_units_2=HIDDEN_UNITS_2,
+        learning_rate=LEARNING_RATE,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        sample_nbr_elbo=SAMPLE_NBR_ELBO,
+        complexity_weight_base=COMPLEXITY_WEIGHT_BASE,
+        n_prediction_samples=N_PREDICTION_SAMPLES,
+        use_random_seed=True,
+        export_prefix=f"{TICKER}_model"
+    )
+    """
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""## On Real Time""")
     return
 
 
 @app.cell
 def _():
+    import time
+    import datetime
+    return datetime, time
+
+
+@app.cell
+def _(BayesianStockPredictor, get_device, joblib, os, torch):
+    # --- Helper function to load artifacts ---
+    def load_prediction_artifacts(prefix: str, export_dir: str = "exported_model"):
+        """Loads model, scalers, and metadata needed for prediction."""
+        print(f"Loading artifacts with prefix '{prefix}' from '{export_dir}'...")
+
+        # Load scalers and metadata
+        scaler_metadata_path = os.path.join(export_dir, f"{prefix}_scalers_metadata.joblib")
+        if not os.path.exists(scaler_metadata_path):
+            raise FileNotFoundError(f"Scaler/metadata file not found: {scaler_metadata_path}")
+        artifacts = joblib.load(scaler_metadata_path)
+        feature_scaler = artifacts['feature_scaler']
+        target_scaler = artifacts['target_scaler']
+        feature_cols_final = artifacts['feature_cols_final']
+        # target_cols = artifacts['target_cols'] # Less critical for prediction input
+        config = artifacts['config']
+        n_lags = config['N_LAGS']
+        n_steps_ahead = config['N_STEPS_AHEAD']
+        hidden_units_1 = config['HIDDEN_UNITS_1']
+        hidden_units_2 = config['HIDDEN_UNITS_2']
+        print("  Scalers and metadata loaded.")
+
+        # Load model
+        input_dim = len(feature_cols_final)
+        output_dim = n_steps_ahead
+        device = get_device() # Re-determine device
+        model = BayesianStockPredictor(input_dim, output_dim, hidden_units_1, hidden_units_2)
+
+        model_path = os.path.join(export_dir, f"{prefix}_state_dict.pth")
+        if not os.path.exists(model_path):
+             raise FileNotFoundError(f"Model state file not found: {model_path}")
+        # Load state dict, ensuring it's mapped to the correct device
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval() # Set model to evaluation mode
+        print(f"  Model loaded and set to '{device}' device in evaluation mode.")
+
+        return model, feature_scaler, target_scaler, feature_cols_final, n_lags, n_steps_ahead, device, config
+    return (load_prediction_artifacts,)
+
+
+@app.cell
+def _(
+    add_technical_indicators,
+    create_lagged_features,
+    datetime,
+    load_prediction_artifacts,
+    np,
+    pd,
+    plt,
+    select_features,
+    selected_features_list,
+    time,
+    torch,
+    yf,
+):
+    def validate_real_time(
+        model_prefix: str,
+        ticker: str,
+        validation_duration_minutes: int = 25,
+        update_interval_seconds: int = 60,
+        n_prediction_samples: int = 100, # Use the same as training or adjust
+        history_fetch_period: str = '5d' # How much history to fetch each time for TA/lags
+        ):
+        """
+        Loads a trained model and performs validation using real-time data.
+
+        Args:
+            model_prefix (str): Prefix used when saving model artifacts (e.g., "BTC-USD_model").
+            ticker (str): The ticker symbol to fetch real-time data for (e.g., "BTC-USD").
+            validation_duration_minutes (int): How long to run the validation loop.
+            update_interval_seconds (int): How often to fetch data and predict (should be >= 60 for 1m interval).
+            n_prediction_samples (int): Number of samples for Bayesian prediction uncertainty.
+            history_fetch_period (str): yfinance period string to fetch sufficient history
+                                         for calculating TAs and lags (e.g., '5d', '3d'). Needs to be
+                                         long enough to cover max lookback of TAs + n_lags.
+        """
+        try:
+            # --- 1. Load Artifacts ---
+            model, feature_scaler, target_scaler, feature_cols_final, n_lags, n_steps_ahead, device, config = \
+                load_prediction_artifacts(model_prefix)
+            base_features_used = config.get('base_features', selected_features_list) # Get base features from config if saved, else use global
+
+
+            # --- 2. Initialize Storage for Plotting ---
+            timestamps = []
+            actual_prices = []
+            predicted_means_step1 = []
+            predicted_lowers_step1 = []
+            predicted_uppers_step1 = []
+
+            # --- 3. Real-time Validation Loop ---
+            end_time = time.time() + validation_duration_minutes * 60
+            print(f"\n--- Starting Real-time Validation for {ticker} ---")
+            print(f"Duration: {validation_duration_minutes} minutes")
+            print(f"Fetching data every {update_interval_seconds} seconds")
+            print(f"Predicting {n_steps_ahead} steps ahead.")
+            print(f"Using history period: {history_fetch_period} for TA/Lags calculation.")
+            print(f"Press Ctrl+C to stop early.")
+
+            while time.time() < end_time:
+                loop_start_time = time.time()
+                current_dt = datetime.datetime.now()
+                print(f"\n{current_dt.strftime('%Y-%m-%d %H:%M:%S')} - Fetching latest data...")
+
+                try:
+                    # --- 3a. Fetch Data ---
+                    # Fetch sufficient historical data ending now, with 1m interval
+                    data_hist = yf.Ticker(ticker).history(period=history_fetch_period, interval='1m', auto_adjust=True)
+                    data_hist = data_hist.drop(columns=['Dividends', 'Stock Splits'], errors='ignore')
+
+                    if data_hist.empty:
+                        print("  Warning: No data received. Skipping this interval.")
+                        time.sleep(max(0, update_interval_seconds - (time.time() - loop_start_time)))
+                        continue
+
+                    # Ensure timezone is consistent or removed if necessary (yfinance can be tricky)
+                    if data_hist.index.tz is not None:
+                         data_hist.index = data_hist.index.tz_convert(None) # Or convert to UTC: data_hist.index.tz_convert('UTC')
+
+                    latest_timestamp = data_hist.index[-1]
+                    latest_actual_close = data_hist['Close'].iloc[-1]
+                    print(f"  Latest data point timestamp: {latest_timestamp}, Close: {latest_actual_close:.2f}")
+
+                    # --- 3b. Preprocess Data ---
+                    # Important: Apply TAs and lags to the whole fetched dataframe
+                    # to ensure calculations are correct for the last point.
+                    df_ta = add_technical_indicators(data_hist)
+                    base_feature_cols_available = [f for f in base_features_used if f in df_ta.columns]
+                    df_selected = select_features(df_ta, base_feature_cols_available) # Select only base features first
+                    df_lagged, lagged_feature_cols = create_lagged_features(df_selected, base_feature_cols_available, n_lags)
+
+                    # Combine base + lagged features required by the model
+                    all_needed_features = base_feature_cols_available + lagged_feature_cols
+                    df_final_features = df_lagged[all_needed_features]
+
+                    # Clean NaNs resulting from TAs/lags
+                    df_final_features_clean = df_final_features.dropna()
+
+                    if df_final_features_clean.empty:
+                        print("  Warning: Not enough data to calculate all features/lags after cleaning. Skipping.")
+                        time.sleep(max(0, update_interval_seconds - (time.time() - loop_start_time)))
+                        continue
+
+                    # Select the *very last* row for prediction
+                    X_latest = df_final_features_clean.iloc[-1:] # Keep as DataFrame row
+
+                    # Ensure columns are in the exact same order as during training
+                    X_latest = X_latest[feature_cols_final]
+
+                    # Scale features
+                    X_latest_scaled = feature_scaler.transform(X_latest)
+
+                    # Convert to Tensor
+                    X_latest_tensor = torch.tensor(X_latest_scaled, dtype=torch.float32).to(device)
+
+                    # --- 3c. Predict ---
+                    with torch.no_grad():
+                        pred_samples_scaled = [model(X_latest_tensor).cpu().numpy() for _ in range(n_prediction_samples)]
+                    # Shape: (n_samples, 1, n_steps_ahead) -> (n_samples, n_steps_ahead)
+                    pred_samples_scaled = np.squeeze(np.array(pred_samples_scaled), axis=1)
+
+                    # Calculate mean and std dev across samples
+                    pred_mean_scaled = pred_samples_scaled.mean(axis=0)
+                    pred_std_scaled = pred_samples_scaled.std(axis=0)
+
+                    # Inverse transform predictions
+                    # Reshape mean/std to (1, n_steps_ahead) for the scaler
+                    pred_mean = target_scaler.inverse_transform(pred_mean_scaled.reshape(1, -1)).flatten()
+                    # For bounds, calculate in scaled space and inverse transform
+                    lower_bound_scaled = pred_mean_scaled - 1.96 * pred_std_scaled
+                    upper_bound_scaled = pred_mean_scaled + 1.96 * pred_std_scaled
+                    pred_lower = target_scaler.inverse_transform(lower_bound_scaled.reshape(1, -1)).flatten()
+                    pred_upper = target_scaler.inverse_transform(upper_bound_scaled.reshape(1, -1)).flatten()
+
+                    # We are interested in the prediction for the *next* step (t+1)
+                    predicted_mean_next_step = pred_mean[0]
+                    predicted_lower_next_step = pred_lower[0]
+                    predicted_upper_next_step = pred_upper[0]
+
+                    print(f"  Predicted Close for next step ({latest_timestamp + pd.Timedelta(minutes=1)}):")
+                    print(f"    Mean: {predicted_mean_next_step:.2f}")
+                    print(f"    95% CI: [{predicted_lower_next_step:.2f}, {predicted_upper_next_step:.2f}]")
+
+                    # --- 3d. Store Results ---
+                    timestamps.append(latest_timestamp) # Store timestamp of the data *used* for prediction
+                    actual_prices.append(latest_actual_close)
+                    predicted_means_step1.append(predicted_mean_next_step)
+                    predicted_lowers_step1.append(predicted_lower_next_step)
+                    predicted_uppers_step1.append(predicted_upper_next_step)
+
+                except ConnectionError as e:
+                    print(f"  Error fetching data: {e}. Retrying next cycle.")
+                except Exception as e:
+                    print(f"  An error occurred during processing: {e}")
+                    import traceback
+                    traceback.print_exc() # Print detailed traceback for debugging
+                    print("  Skipping this interval.")
+
+                # --- 3e. Wait for next interval ---
+                elapsed_time = time.time() - loop_start_time
+                sleep_time = update_interval_seconds - elapsed_time
+                if sleep_time > 0:
+                    # print(f"  Sleeping for {sleep_time:.1f} seconds...")
+                    time.sleep(sleep_time)
+
+            print("\n--- Validation Loop Finished ---")
+
+            # --- 4. Plot Results ---
+            if not timestamps:
+                print("No data collected during validation run. Cannot plot.")
+                return None
+
+            print("Plotting results...")
+            plt.figure(figsize=(15, 8))
+            # Plot actual prices observed during the run
+            plt.plot(timestamps, actual_prices, label='Actual Close Price', color='blue', marker='.', linestyle='-')
+
+            # Plot the 1-step ahead predicted mean prices
+            # Shift predicted times by 1 minute to align with what they are predicting
+            predicted_timestamps = [ts + pd.Timedelta(minutes=1) for ts in timestamps]
+            plt.plot(predicted_timestamps, predicted_means_step1, label='Predicted Mean (1-Step Ahead)', color='orange', marker='x', linestyle='--')
+
+            # Plot the 1-step ahead uncertainty bounds
+            plt.fill_between(predicted_timestamps,
+                             predicted_lowers_step1,
+                             predicted_uppers_step1,
+                             color='orangered', alpha=0.3, label='95% CI (1-Step Ahead)')
+
+            plt.title(f'{ticker} Real-time Validation ({validation_duration_minutes} min) - Actual vs 1-Step Prediction')
+            plt.xlabel('Time')
+            plt.ylabel('Price')
+            plt.legend()
+            plt.grid(True)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.show()
+
+            # --- 5. Return Collected Data (Optional) ---
+            results_df = pd.DataFrame({
+                'Timestamp': timestamps,
+                'ActualClose': actual_prices,
+                'PredictedMean_Step1': predicted_means_step1,
+                'PredictedLower_Step1': predicted_lowers_step1,
+                'PredictedUpper_Step1': predicted_uppers_step1
+            }).set_index('Timestamp')
+
+            return results_df
+
+        except FileNotFoundError as e:
+            print(f"Error: {e}. Make sure the model artifacts exist in the 'exported_model' directory.")
+            print("Did you run the training script successfully first?")
+            return None
+        except KeyboardInterrupt:
+            print("\nValidation interrupted by user.")
+            # Still try to plot if some data was collected
+            if timestamps:
+                 print("Plotting collected data...")
+                 plt.figure(figsize=(15, 8))
+                 plt.plot(timestamps, actual_prices, label='Actual Close Price', color='blue', marker='.', linestyle='-')
+                 predicted_timestamps = [ts + pd.Timedelta(minutes=1) for ts in timestamps]
+                 plt.plot(predicted_timestamps, predicted_means_step1, label='Predicted Mean (1-Step Ahead)', color='orange', marker='x', linestyle='--')
+                 plt.fill_between(predicted_timestamps, predicted_lowers_step1, predicted_uppers_step1, color='orangered', alpha=0.3, label='95% CI (1-Step Ahead)')
+                 plt.title(f'{ticker} Real-time Validation (Interrupted) - Actual vs 1-Step Prediction')
+                 plt.xlabel('Time')
+                 plt.ylabel('Price')
+                 plt.legend()
+                 plt.grid(True)
+                 plt.xticks(rotation=45)
+                 plt.tight_layout()
+                 plt.show()
+                 # Return partial data
+                 results_df = pd.DataFrame({
+                     'Timestamp': timestamps,
+                     'ActualClose': actual_prices,
+                     'PredictedMean_Step1': predicted_means_step1,
+                     'PredictedLower_Step1': predicted_lowers_step1,
+                     'PredictedUpper_Step1': predicted_uppers_step1
+                 }).set_index('Timestamp')
+                 return results_df
+            else:
+                 print("No data collected before interruption.")
+                 return None
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    return
+
+
+@app.cell
+def _():
+    """
+    MODEL_EXPORT_PREFIX = f"{TICKER}_model" # e.g., "BTC-USD_model"
+
+    # Run the real-time validation
+    validation_results = validate_real_time(
+        model_prefix=MODEL_EXPORT_PREFIX,
+        ticker=TICKER, # e.g., "BTC-USD"
+        validation_duration_minutes=25,
+        update_interval_seconds=60,
+        n_prediction_samples=100, # Should match or be appropriate for prediction
+        history_fetch_period='5d' # Adjust if needed based on TAs/lags
+    )
+
+    if validation_results is not None:
+        print("\nValidation Results DataFrame:")
+        print(validation_results.head())
+        # You can save this dataframe if needed:
+        # validation_results.to_csv("realtime_validation_results.csv")
+    """
     return
 
 
