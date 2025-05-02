@@ -99,7 +99,7 @@ def _():
     HIDDEN_UNITS_1 = 64
     HIDDEN_UNITS_2 = 32
     LEARNING_RATE = 0.006
-    EPOCHS = 240 # Reduced for quicker testing, you can increase it back
+    EPOCHS = 200 # Reduced for quicker testing, you can increase it back
     # BATCH_SIZE = 128
     BATCH_SIZE = 256
     SAMPLE_NBR_ELBO = 5
