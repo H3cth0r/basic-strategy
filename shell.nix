@@ -2,17 +2,19 @@
 
 pkgs.mkShell {
   buildInputs = [
-    pkgs.python3
-    pkgs.python3Packages.virtualenv
+    pkgs.python312
+    pkgs.python312Packages.virtualenv
     
     # System dependencies
     pkgs.libffi
     pkgs.zlib
     pkgs.stdenv.cc.cc.lib  # Essential for PyTorch/C++ extensions
     
-    # Uncomment for CUDA support (if needed)
-    # pkgs.cudatoolkit
-    # pkgs.cudnn
+    pkgs.python312Packages.numpy
+    pkgs.python312Packages.pandas
+    pkgs.python312Packages.matplotlib
+    pkgs.python312Packages.yfinance
+    pkgs.python312Packages.torch
   ];
 
   shellHook = ''
