@@ -1,0 +1,156 @@
+{
+  "version": "1",
+  "metadata": {
+    "marimo_version": "0.13.15"
+  },
+  "cells": [
+    {
+      "id": "Hbol",
+      "code_hash": "87372cdbff1880570e59574b3f220058",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "MJUe",
+      "code_hash": "d1607d215ff5b08dab755261c6774d66",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "vPqm",
+      "code_hash": "7db5b43b1a763d354ee98772a27aa0e8",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "VuAg",
+      "code_hash": "fed725156b2348fc91a331d74c3cd46e",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "cVti",
+      "code_hash": "183893d00873f79a1c1a3c9a0fab3196",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "LEQK",
+      "code_hash": "fcc7439cc864efb5419b5731cd3e112b",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "AAIv",
+      "code_hash": "87d38c4560686041d318b4fc856ded45",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": [
+        {
+          "type": "stream",
+          "name": "stdout",
+          "text": "Downloading data for FIBRAMQ.MX...\n"
+        },
+        {
+          "type": "stream",
+          "name": "stdout",
+          "text": "  -> An error occurred for FIBRAMQ.MX: Too Many Requests. Rate limited. Try after a while.\nDownloading data for FUNO11.MX...\n"
+        },
+        {
+          "type": "stream",
+          "name": "stdout",
+          "text": "  -> An error occurred for FUNO11.MX: Too Many Requests. Rate limited. Try after a while.\nDownloading data for DANHOS13.MX...\n"
+        },
+        {
+          "type": "stream",
+          "name": "stdout",
+          "text": "  -> An error occurred for DANHOS13.MX: Too Many Requests. Rate limited. Try after a while.\nDownloading data for FMTY14.MX...\n"
+        },
+        {
+          "type": "stream",
+          "name": "stdout",
+          "text": "  -> An error occurred for FMTY14.MX: Too Many Requests. Rate limited. Try after a while.\nDownloading data for TERRA13.MX...\n"
+        },
+        {
+          "type": "stream",
+          "name": "stdout",
+          "text": "  -> An error occurred for TERRA13.MX: Too Many Requests. Rate limited. Try after a while.\n\nNo data was successfully processed. Unable to generate plots.\n"
+        }
+      ]
+    },
+    {
+      "id": "mIVh",
+      "code_hash": null,
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "nKEu",
+      "code_hash": null,
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    }
+  ]
+}

@@ -15,6 +15,7 @@ pkgs.mkShell {
     pkgs.python312Packages.matplotlib
     pkgs.python312Packages.yfinance
     pkgs.python312Packages.torch
+    pkgs.python312Packages.seaborn
   ];
 
   shellHook = ''
