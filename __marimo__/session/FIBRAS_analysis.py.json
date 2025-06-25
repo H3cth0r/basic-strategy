@@ -6,7 +6,7 @@
   "cells": [
     {
       "id": "Hbol",
-      "code_hash": "87372cdbff1880570e59574b3f220058",
+      "code_hash": "34b385d80834a829305c9dbc21175171",
       "outputs": [
         {
           "type": "data",
@@ -19,7 +19,7 @@
     },
     {
       "id": "MJUe",
-      "code_hash": "d1607d215ff5b08dab755261c6774d66",
+      "code_hash": "8371b23e8eb487756743b156455fb339",
       "outputs": [
         {
           "type": "data",
@@ -31,8 +31,8 @@
       "console": []
     },
     {
-      "id": "vPqm",
-      "code_hash": "7db5b43b1a763d354ee98772a27aa0e8",
+      "id": "vblA",
+      "code_hash": "ed08abb7f994ca4c85d9229f2d25f5ad",
       "outputs": [
         {
           "type": "data",
@@ -44,8 +44,8 @@
       "console": []
     },
     {
-      "id": "VuAg",
-      "code_hash": "fed725156b2348fc91a331d74c3cd46e",
+      "id": "bkHC",
+      "code_hash": "d16bc15b1372d79cae6495aeba2184f3",
       "outputs": [
         {
           "type": "data",
@@ -57,8 +57,8 @@
       "console": []
     },
     {
-      "id": "cVti",
-      "code_hash": "183893d00873f79a1c1a3c9a0fab3196",
+      "id": "lEQa",
+      "code_hash": "ce9cb71a2554a821979f2cb2a08b9692",
       "outputs": [
         {
           "type": "data",
@@ -70,8 +70,8 @@
       "console": []
     },
     {
-      "id": "LEQK",
-      "code_hash": "fcc7439cc864efb5419b5731cd3e112b",
+      "id": "PKri",
+      "code_hash": "f6f06c10f7ae996932cd7641fd4b84b4",
       "outputs": [
         {
           "type": "data",
@@ -83,52 +83,33 @@
       "console": []
     },
     {
-      "id": "AAIv",
-      "code_hash": "87d38c4560686041d318b4fc856ded45",
+      "id": "Xref",
+      "code_hash": "2ac0b0d594009209a11a9d1effabe041",
       "outputs": [
         {
-          "type": "data",
-          "data": {
-            "text/plain": ""
-          }
+          "type": "error",
+          "ename": "exception",
+          "evalue": "name 'pd' is not defined",
+          "traceback": []
         }
       ],
       "console": [
         {
           "type": "stream",
-          "name": "stdout",
-          "text": "Downloading data for FIBRAMQ.MX...\n"
-        },
-        {
-          "type": "stream",
-          "name": "stdout",
-          "text": "  -> An error occurred for FIBRAMQ.MX: Too Many Requests. Rate limited. Try after a while.\nDownloading data for FUNO11.MX...\n"
-        },
-        {
-          "type": "stream",
-          "name": "stdout",
-          "text": "  -> An error occurred for FUNO11.MX: Too Many Requests. Rate limited. Try after a while.\nDownloading data for DANHOS13.MX...\n"
-        },
-        {
-          "type": "stream",
-          "name": "stdout",
-          "text": "  -> An error occurred for DANHOS13.MX: Too Many Requests. Rate limited. Try after a while.\nDownloading data for FMTY14.MX...\n"
-        },
-        {
-          "type": "stream",
-          "name": "stdout",
-          "text": "  -> An error occurred for FMTY14.MX: Too Many Requests. Rate limited. Try after a while.\nDownloading data for TERRA13.MX...\n"
-        },
-        {
-          "type": "stream",
-          "name": "stdout",
-          "text": "  -> An error occurred for TERRA13.MX: Too Many Requests. Rate limited. Try after a while.\n\nNo data was successfully processed. Unable to generate plots.\n"
+          "name": "stderr",
+          "text": "<span class=\"codehilite\"><div class=\"highlight\"><pre><span></span><span class=\"gt\">Traceback (most recent call last):</span>\n  File <span class=\"nb\">&quot;/home/h3cth0r/Documents/basic-strategy/venv/lib/python3.12/site-packages/marimo/_runtime/executor.py&quot;</span>, line <span class=\"m\">138</span>, in <span class=\"n\">execute_cell</span>\n<span class=\"w\">    </span><span class=\"n\">exec</span><span class=\"p\">(</span><span class=\"n\">cell</span><span class=\"o\">.</span><span class=\"n\">body</span><span class=\"p\">,</span> <span class=\"n\">glbls</span><span class=\"p\">)</span>\n  File <span class=\"nb\">&quot;/tmp/nix-shell-17100-0/marimo_18484/__marimo__cell_Xref_.py&quot;</span>, line <span class=\"m\">11</span>, in <span class=\"n\">&lt;module&gt;</span>\n<span class=\"w\">    </span><span class=\"n\">END_DATE</span> <span class=\"o\">=</span> <span class=\"n\">pd</span><span class=\"o\">.</span><span class=\"n\">to_datetime</span><span class=\"p\">(</span><span class=\"s1\">&#39;today&#39;</span><span class=\"p\">)</span><span class=\"o\">.</span><span class=\"n\">strftime</span><span class=\"p\">(</span><span class=\"s1\">&#39;%Y-%m-</span><span class=\"si\">%d</span><span class=\"s1\">&#39;</span><span class=\"p\">)</span>\n<span class=\"w\">               </span><span class=\"pm\">^^</span>\n<span class=\"gr\">NameError</span>: <span class=\"n\">name &#39;pd&#39; is not defined</span>\n</pre></div>\n</span>"
         }
       ]
     },
     {
-      "id": "mIVh",
+      "id": "SFPL",
       "code_hash": null,
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "BYtC",
+      "code_hash": "a53c42be8c8443ef49946433b2aba3a5",
       "outputs": [
         {
           "type": "data",
@@ -140,13 +121,52 @@
       "console": []
     },
     {
-      "id": "nKEu",
-      "code_hash": null,
+      "id": "ZBYw",
+      "code_hash": "a9670717b740e5c02c76b2ce59d39cb3",
       "outputs": [
         {
           "type": "data",
           "data": {
             "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "lOFQ",
+      "code_hash": "9a55d824b3f315e1857bbb07c23e0e05",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "ttEb",
+      "code_hash": "35eefbabc8fe817cc8e25e00d659c0d2",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/html": "<span class=\"markdown prose dark:prose-invert\"><h2 id=\"configuration\">Configuration</h2></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "xkXE",
+      "code_hash": "0d04755a373145d74839759d44f030ef",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/html": "<span class=\"markdown prose dark:prose-invert\"><h2 id=\"data-fetching-and-processing\">Data Fetching and Processing</h2></span>"
           }
         }
       ],
