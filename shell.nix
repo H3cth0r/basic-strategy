@@ -4,39 +4,26 @@ pkgs.mkShell {
   buildInputs = [
     pkgs.python312
     pkgs.python312Packages.virtualenv
-    
-    # System dependencies
-    pkgs.libffi
-    pkgs.zlib
-    pkgs.stdenv.cc.cc.lib  # Essential for PyTorch/C++ extensions
-    
-    pkgs.python312Packages.numpy
-    pkgs.python312Packages.pandas
-    pkgs.python312Packages.matplotlib
-    pkgs.python312Packages.yfinance
-    pkgs.python312Packages.torch
-    pkgs.python312Packages.seaborn
+    pkgs.zlib  # Explicitly include zlib
   ];
 
+  # Add all necessary libraries to LD_LIBRARY_PATH
+  LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [
+    pkgs.stdenv.cc.cc.lib  # C++ library
+    pkgs.zlib              # zlib library
+  ]}";
+
   shellHook = ''
-    # Create virtual environment if missing
-    if [ ! -d "venv" ]; then
-      virtualenv venv
-    fi
-
-    # Activate virtual environment
-    source venv/bin/activate
-
-    # Install requirements
-    if [ -f "requirements.txt" ]; then
-      # Ensure pip is upgraded first
-      pip install --upgrade pip
-      pip install -r requirements.txt
+    # Create and activate virtual environment if not present
+    VENV_DIR="$(pwd)/.venv"
+    if [ ! -d "$VENV_DIR" ]; then
+      echo "Creating virtual environment..."
+      python -m venv "$VENV_DIR"
+      source "$VENV_DIR/bin/activate"
+      pip install --upgrade pip setuptools
+      pip install numpy pandas matplotlib yfinance torch seaborn plotly scikit-learn ta tqdm gym
     else
-      echo "No requirements.txt found"
+      source "$VENV_DIR/bin/activate"
     fi
-
-    # Help Python find libstdc++
-    export LD_LIBRARY_PATH=${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
   '';
 }
