@@ -171,53 +171,52 @@ class TradingEnv:
     def step(self, action):
         """Executes one time step in the environment."""
         current_price = self.df['Close'].iloc[self.current_step]
-        executed_action = 0  # FIX: Default to Hold (0)
-
-        # --- Trade Execution Logic ---
-        if action == 1 and self.cash > 1:  # Attempt to Buy
-            btc_to_buy = (self.cash * (1 - TAKER_FEE)) / current_price
-            self.btc_held += btc_to_buy
-            self.cash = 0
-            self.total_trades += 1
-            self.buy_trades += 1
-            self.hold_streak = 0
-            executed_action = 1  # Mark as successful Buy
-        elif action == 2 and self.btc_held > 1e-6:  # Attempt to Sell
-            self.cash += self.btc_held * current_price * (1 - MAKER_FEE)
-            self.btc_held = 0
-            self.total_trades += 1
-            self.sell_trades += 1
-            self.hold_streak = 0
-            executed_action = 2  # Mark as successful Sell
-
-        # If no trade was executed (action was Hold or trade was invalid)
-        if executed_action == 0:
+        
+        # FIX: Default to Hold action (0) and only change if a trade is executed.
+        executed_action = 0 
+        
+        if action == 1: # Buy Attempt
+            if self.cash > 1: # Condition to execute
+                btc_to_buy = (self.cash * (1 - TAKER_FEE)) / current_price
+                self.btc_held += btc_to_buy
+                self.cash = 0
+                self.total_trades += 1
+                self.buy_trades += 1
+                self.hold_streak = 0
+                executed_action = 1 # Mark that a buy was executed
+        elif action == 2: # Sell Attempt
+            if self.btc_held > 1e-6: # Condition to execute
+                self.cash += self.btc_held * current_price * (1 - MAKER_FEE)
+                self.btc_held = 0
+                self.total_trades += 1
+                self.sell_trades += 1
+                self.hold_streak = 0
+                executed_action = 2 # Mark that a sell was executed
+        else: # Hold
             self.hold_streak += 1
 
-        # --- State Update ---
         self.current_step += 1
         next_price = self.df['Close'].iloc[self.current_step]
         self.holdings_value = self.btc_held * next_price
-
+        
         previous_portfolio_value = self.portfolio_value
         self.portfolio_value = self.cash + self.holdings_value
-
-        # --- Reward and Done Signal ---
+        
         reward = self._calculate_reward(previous_portfolio_value)
         done = (self.portfolio_value <= 0.2 * self.initial_capital) or (self.current_step >= self.end_step)
-
-        # --- History Logging ---
+        
+        # FIX: Log the executed_action instead of the original attempted action.
         self.history.append({
             'step': self.current_step,
             'price': current_price,
             'portfolio_value': self.portfolio_value,
             'cash': self.cash,
             'holdings': self.holdings_value,
-            'action': executed_action  # FIX: Log the *executed* action
+            'action': executed_action 
         })
-
+        
         next_state = self._get_state() if not done else None
-
+        
         return next_state, reward, done, {}
 
     def _calculate_reward(self, previous_portfolio_value):
@@ -346,8 +345,8 @@ def plot_validation_results(history, episode):
     df_history = pd.DataFrame(history)
     df_history.set_index('step', inplace=True)
     
-    # This logic now works correctly because 'action' in the history log
-    # reflects the *executed* action.
+    # This filtering now works correctly because the 'action' in history is only 1 or 2
+    # if a trade was actually executed.
     buys = df_history[df_history['action'] == 1]
     sells = df_history[df_history['action'] == 2]
 
@@ -357,7 +356,7 @@ def plot_validation_results(history, episode):
         shared_xaxes=True,
         vertical_spacing=0.05,
         subplot_titles=(
-            'Market Price & Trades',
+            'Market Price & Executed Trades', # Title updated for clarity
             'Portfolio Value ($)',
             'Cash Account ($)',
             'Holdings Value ($)'

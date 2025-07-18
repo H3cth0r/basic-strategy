@@ -21,7 +21,7 @@ pkgs.mkShell {
       python -m venv "$VENV_DIR"
       source "$VENV_DIR/bin/activate"
       pip install --upgrade pip setuptools
-      pip install numpy pandas matplotlib yfinance torch seaborn plotly scikit-learn ta tqdm gym
+      pip install numpy pandas matplotlib yfinance torch seaborn plotly scikit-learn ta tqdm gym gymnasium flask
     else
       source "$VENV_DIR/bin/activate"
     fi
