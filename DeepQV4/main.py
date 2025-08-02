@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 import random
 from collections import deque
 import math
+import os
 
 # --- 1. Data Loading and Preprocessing ---
 
@@ -189,6 +190,11 @@ class DQNAgent:
 
     def update_target_network(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
+    
+    def save_model(self, path):
+        """Saves the policy network's state dictionary."""
+        torch.save(self.policy_net.state_dict(), path)
+        print(f"Model saved to {path}")
 
 # --- 4. Trading Environment ---
 
@@ -343,8 +349,9 @@ def main():
     LEARNING_RATE = 0.0001
     TARGET_UPDATE = 5
     WINDOW_SIZE = 180
-    MIN_TRADE_AMOUNT_BUY = 100  # Minimum dollar amount for a buy trade
-    MIN_TRADE_AMOUNT_SELL = 100 # Minimum dollar amount for a sell trade
+    MIN_TRADE_AMOUNT_BUY = 1  # Minimum dollar amount for a buy trade
+    MIN_TRADE_AMOUNT_SELL = 1 # Minimum dollar amount for a sell trade
+    INITIAL_CREDIT = 100 # Your initial credit as a variable
 
     # --- Setup ---
     full_data = get_data()
@@ -361,7 +368,7 @@ def main():
     print(f"Validation data size: {len(val_data)}")
     print(f"Test data size: {len(test_data)}")
 
-    env_prototype = TradingEnvironment(full_data, window_size=WINDOW_SIZE, 
+    env_prototype = TradingEnvironment(full_data, initial_credit=INITIAL_CREDIT, window_size=WINDOW_SIZE,
                                      min_trade_amount_buy=MIN_TRADE_AMOUNT_BUY,
                                      min_trade_amount_sell=MIN_TRADE_AMOUNT_SELL)
     n_features = env_prototype.n_features
@@ -370,6 +377,11 @@ def main():
     agent = DQNAgent(state_dim=n_features, action_dim=n_actions,
                      attention_dim=ATTENTION_DIM, attention_heads=ATTENTION_HEADS,
                      learning_rate=LEARNING_RATE)
+
+    # Create a directory to save models if it doesn't exist
+    model_dir = "saved_models"
+    os.makedirs(model_dir, exist_ok=True)
+
 
     # --- Training Loop ---
     for e in range(EPISODES):
@@ -382,7 +394,7 @@ def main():
         episode_data = train_data.iloc[start_index : start_index + episode_length_minutes].copy()
         
         print(f"Starting Training Phase on data from {episode_data.index[0]} to {episode_data.index[-1]}...")
-        train_env = TradingEnvironment(episode_data, window_size=WINDOW_SIZE, 
+        train_env = TradingEnvironment(episode_data, initial_credit=INITIAL_CREDIT, window_size=WINDOW_SIZE,
                                        min_trade_amount_buy=MIN_TRADE_AMOUNT_BUY,
                                        min_trade_amount_sell=MIN_TRADE_AMOUNT_SELL)
         run_episode(train_env, agent, episode_data, BATCH_SIZE)
@@ -391,10 +403,13 @@ def main():
         if (e + 1) % TARGET_UPDATE == 0:
             agent.update_target_network()
             print("Target network updated.")
+
+        # Save the model at the end of each episode
+        agent.save_model(os.path.join(model_dir, f"model_episode_{e+1}.pth"))
             
         # --- Validation Phase ---
         print("\nStarting Validation Phase...")
-        val_env = TradingEnvironment(val_data, window_size=WINDOW_SIZE, 
+        val_env = TradingEnvironment(val_data, initial_credit=INITIAL_CREDIT, window_size=WINDOW_SIZE, 
                                      min_trade_amount_buy=MIN_TRADE_AMOUNT_BUY,
                                      min_trade_amount_sell=MIN_TRADE_AMOUNT_SELL)
         portfolio_values, credits, holdings_values, trades = run_episode(val_env, agent, val_data, BATCH_SIZE, is_eval=True)
@@ -424,7 +439,7 @@ def main():
 
     # --- Final Testing Phase (after all training is done) ---
     print("\n\n--- All training complete. Starting Final Test ---")
-    test_env = TradingEnvironment(test_data, window_size=WINDOW_SIZE,
+    test_env = TradingEnvironment(test_data, initial_credit=INITIAL_CREDIT, window_size=WINDOW_SIZE,
                                   min_trade_amount_buy=MIN_TRADE_AMOUNT_BUY,
                                   min_trade_amount_sell=MIN_TRADE_AMOUNT_SELL)
     portfolio_values, credits, holdings_values, trades = run_episode(test_env, agent, test_data, BATCH_SIZE, is_eval=True)
