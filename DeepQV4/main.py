@@ -193,12 +193,14 @@ class DQNAgent:
 # --- 4. Trading Environment ---
 
 class TradingEnvironment:
-    def __init__(self, data, initial_credit=10000, fee=0.001, window_size=180):
+    def __init__(self, data, initial_credit=10000, fee=0.001, window_size=180, min_trade_amount_buy=100, min_trade_amount_sell=100):
         self.data = data
         self.normalized_data = data.drop(columns=['Original_Close'])
         self.initial_credit = initial_credit
         self.fee = fee
         self.window_size = window_size
+        self.min_trade_amount_buy = min_trade_amount_buy
+        self.min_trade_amount_sell = min_trade_amount_sell
         self.n_features = self.normalized_data.shape[1] + 2
         self.action_space = [-.5, -.25, 0, .25, .5]
         self.n_actions = len(self.action_space)
@@ -230,8 +232,9 @@ class TradingEnvironment:
 
         if action < 0:
             sell_fraction = -action
-            sell_amount = self.holdings * sell_fraction
-            if sell_amount > 0:
+            sell_amount_in_usd = self.holdings * sell_fraction * current_price
+            if sell_amount_in_usd > self.min_trade_amount_sell:
+                sell_amount = self.holdings * sell_fraction
                 self.credit += sell_amount * current_price * (1 - self.fee)
                 self.holdings -= sell_amount
                 self.trades.append({'step': self.current_step, 'type': 'sell', 'price': current_price, 'amount': sell_amount})
@@ -241,7 +244,7 @@ class TradingEnvironment:
         elif action > 0:
             buy_fraction = action
             investment = self.credit * buy_fraction
-            if investment > 0:
+            if investment > self.min_trade_amount_buy:
                 buy_amount = (investment / current_price) * (1 - self.fee)
                 total_cost = (self.average_buy_price * self.holdings) + investment
                 self.holdings += buy_amount
@@ -340,6 +343,8 @@ def main():
     LEARNING_RATE = 0.0001
     TARGET_UPDATE = 5
     WINDOW_SIZE = 180
+    MIN_TRADE_AMOUNT_BUY = 100  # Minimum dollar amount for a buy trade
+    MIN_TRADE_AMOUNT_SELL = 100 # Minimum dollar amount for a sell trade
 
     # --- Setup ---
     full_data = get_data()
@@ -356,7 +361,9 @@ def main():
     print(f"Validation data size: {len(val_data)}")
     print(f"Test data size: {len(test_data)}")
 
-    env_prototype = TradingEnvironment(full_data, window_size=WINDOW_SIZE)
+    env_prototype = TradingEnvironment(full_data, window_size=WINDOW_SIZE, 
+                                     min_trade_amount_buy=MIN_TRADE_AMOUNT_BUY,
+                                     min_trade_amount_sell=MIN_TRADE_AMOUNT_SELL)
     n_features = env_prototype.n_features
     n_actions = env_prototype.n_actions
     
@@ -375,7 +382,9 @@ def main():
         episode_data = train_data.iloc[start_index : start_index + episode_length_minutes].copy()
         
         print(f"Starting Training Phase on data from {episode_data.index[0]} to {episode_data.index[-1]}...")
-        train_env = TradingEnvironment(episode_data, window_size=WINDOW_SIZE)
+        train_env = TradingEnvironment(episode_data, window_size=WINDOW_SIZE, 
+                                       min_trade_amount_buy=MIN_TRADE_AMOUNT_BUY,
+                                       min_trade_amount_sell=MIN_TRADE_AMOUNT_SELL)
         run_episode(train_env, agent, episode_data, BATCH_SIZE)
         agent.decay_epsilon()
         
@@ -385,7 +394,9 @@ def main():
             
         # --- Validation Phase ---
         print("\nStarting Validation Phase...")
-        val_env = TradingEnvironment(val_data, window_size=WINDOW_SIZE)
+        val_env = TradingEnvironment(val_data, window_size=WINDOW_SIZE, 
+                                     min_trade_amount_buy=MIN_TRADE_AMOUNT_BUY,
+                                     min_trade_amount_sell=MIN_TRADE_AMOUNT_SELL)
         portfolio_values, credits, holdings_values, trades = run_episode(val_env, agent, val_data, BATCH_SIZE, is_eval=True)
 
         plot_results(val_data, e + 1, portfolio_values, credits, holdings_values, trades, plot_title_prefix="Validation")
@@ -413,7 +424,9 @@ def main():
 
     # --- Final Testing Phase (after all training is done) ---
     print("\n\n--- All training complete. Starting Final Test ---")
-    test_env = TradingEnvironment(test_data, window_size=WINDOW_SIZE)
+    test_env = TradingEnvironment(test_data, window_size=WINDOW_SIZE,
+                                  min_trade_amount_buy=MIN_TRADE_AMOUNT_BUY,
+                                  min_trade_amount_sell=MIN_TRADE_AMOUNT_SELL)
     portfolio_values, credits, holdings_values, trades = run_episode(test_env, agent, test_data, BATCH_SIZE, is_eval=True)
     
     plot_results(test_data, EPISODES, portfolio_values, credits, holdings_values, trades, plot_title_prefix="Final Test")
