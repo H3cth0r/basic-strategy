@@ -124,3 +124,37 @@ representation at the cost of additional processing time.
 NOTE: What is **Deep Credit assignment problem associated with BPTT**.
 
 
+
+
+HRM consist of four learnable components:
+- Input network
+- Low level Recurrent module
+- High level recurrent module
+- Output network
+
+
+
+
+Hierachical Convergence
+Although convergen is crucial for recurrent networks, standard RNNs are limited by their tendency to ceonverge too early. As the hiden state settles toward a fixed poiint, update magnitudes shrink, effectively stalling subsequent computation and capping the networks effectrive depth.
+
+To preserve computational prover, we actually want convergence to proceed very slowly-but engineering that graducal approach is difficult, since pushing convergence to far edges sysyem toward instability.
+
+HRM designed to conteract premature convergence through **hierarchical convergence**. During each cycle, the low level module(a RNN) exhibits stable convergence to a local equilibrium. The equilibrium, however, depends on the high level state, supplied during that cycle. After completing the T steps, High level module incorpoerate the sub computations outcome, and performs its own update. THis uupdate stablished frech context for the low level module, essentially **restarting** its computational path and initiating a new convergence phase toward a different local equilibrium.
+
+
+
+
+HRM perofm a sequence of distinct, stable, nested computations, where the high level module directs the overall problem solving strategy, while the low level module executes the intensive search of refinement required for each step.
+
+
+
+
+
+They implemented **Deep Supvervision**, which is inspired by the principle that periodic neural oscillations regulate when learning occurs int the brain.
+
+
+
+
+Adaptive Computational Time (ACT). Brain dynamically modulates the runtime of circuits according to task complexicty and potential rewards.
+HRM incorporates mechanism that enables **thinking, fast and slow**.
