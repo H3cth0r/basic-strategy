@@ -3,6 +3,8 @@ import math
 import json
 import random
 from collections import defaultdict, deque
+from datetime import datetime
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -25,36 +27,43 @@ except Exception:
     AverageTrueRange = None
 
 # -------------------------------------------------
-# 0. HYPERPARAMETERS AND CONFIGURATION
+# 0. HYPERPARAMETERS AND CONFIGURATION (UPDATED)
 # -------------------------------------------------
 class Config:
     # --- Training ---
     EPISODES = 50
-    EPISODE_LENGTH_DAYS = 2.5
+    EPISODE_LENGTH_DAYS = 5.0  # longer horizon
 
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128
     GAMMA = 0.99
-    LEARNING_RATE = 0.0001
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-5
 
-    # Soft target network (Polyak) update parameter (applied every learn() step)
+    # Target network updates
     SOFT_TARGET_TAU = 0.01
+    HARD_UPDATE_EVERY = 2000  # periodic hard copy
 
     # Experience replay
     MEMORY_CAPACITY = 100000
-    LEARN_START_MEMORY = 1500  # count of aggregated decision transitions (not raw minutes)
+    LEARN_START_MEMORY = 8000  # start learning later
 
-    # Learning cadence: run K gradient steps after each pushed decision transition
-    LEARN_UPDATES_PER_PUSH = 2
+    # Learning cadence
+    LEARN_UPDATES_PER_PUSH = 3
 
     # EMA weights for evaluation
-    EMA_MOMENTUM = 0.995  # higher => smoother; evaluate with ema_net
+    EMA_MOMENTUM = 0.995  # slightly faster trailing average
+
+    # Exploration (on top of NoisyNets)
+    EPS_START = 0.10
+    EPS_END = 0.02
+    EPS_ANNEAL_STEPS = 100000  # decision ticks
 
     # Decision frequency (stabilize training and eval to same cadence)
-    TRAIN_DECISION_FREQUENCIES = [15]  # minutes per decision (use single cadence to reduce drift)
+    TRAIN_DECISION_FREQUENCIES = [15]  # minutes per decision
     VAL_DECISION_FREQUENCY = 15        # minutes per decision
 
     # Cooldown (minutes)
-    ACTION_COOLDOWN_MINUTES = 30
+    ACTION_COOLDOWN_MINUTES = 15  # lighter cooldown
 
     # --- Model Architecture ---
     ATTENTION_DIM = 64
@@ -64,43 +73,51 @@ class Config:
 
     # --- Environment ---
     INITIAL_CREDIT = 100.0
-    WINDOW_SIZE = 180
+    WINDOW_SIZE = 360                # longer context
     FEE = 0.001
     MIN_TRADE_CREDIT_BUY = 2.0
     MIN_TRADE_HOLDINGS_SELL = 2.0  # in currency terms
     MAX_EXPOSURE = 0.90            # strict cap on exposure when buying
 
-    # Reward shaping and scaling
-    PV_LOGRET_SCALE = 100.0        # scale log-PV return to improve TD magnitude
-    REWARD_REALIZED = 0.05         # small bonus on realized PnL (normalized by start PV)
-    TRADE_PENALTY = 0.001          # small fixed penalty per executed trade
+    # Reward shaping and scaling (rebalanced)
+    PV_LOGRET_SCALE = 30.0         # reduce scale to avoid saturation
+    # Realized PnL asymmetric weights (normalized by start PV)
+    REALIZED_GAIN_W = 0.15
+    REALIZED_LOSS_W = 0.05
+    TRADE_PENALTY = 0.0002
     TIME_PENALTY = 0.0
-    DRAWDOWN_PENALTY = 0.005
-    FEES_PENALTY_COEF = 0.25
-    REALIZED_CLIP = 0.05           # cap realized component per step
+    DRAWDOWN_PENALTY = 0.003
+    FEES_PENALTY_COEF = 0.10
+    CREDIT_GAIN_W = 0.15           # direct credit growth component (normalized)
+    CREDIT_CLIP = 0.05
+    IDLE_CASH_PENALTY = 0.0003     # tiny nudge out of all-cash local optimum
+    IDLE_AFTER_DECISIONS = 12      # after this many decision ticks idle, start penalty
+    REALIZED_CLIP = 0.10           # cap realized component per step
     FEES_CLIP = 0.02               # cap fees penalty per step
-    REWARD_CLIP = 0.1              # clip total reward per step
+    REWARD_CLIP = 0.30             # allow bigger positive rewards
 
     # --- Prioritized Experience Replay (PER) ---
     PER_ALPHA = 0.6
     PER_BETA_START = 0.4
     PER_BETA_END = 1.0
-    PER_BETA_ANNEAL_STEPS = 100000
+    PER_BETA_ANNEAL_STEPS = 50000  # quicker anneal
     PER_PRIORITY_EPS = 1e-5
     PER_PRIORITY_MAX = 10.0
 
     # --- N-step returns ---
-    N_STEP = 3  # across decision transitions
+    N_STEP = 5  # longer for delayed realization
 
     # --- Validation ---
     VAL_SEGMENT_MINUTES = 2 * 24 * 60  # 2 days per segment
+    IMPROVEMENT_MARGIN = 0.0  # pick strictly better robust score
+    TOP_K_MODELS = 3          # keep top-k EMAs by robust credit metric
 
     # --- Features ---
-    USE_CURATED_FEATURES = False  # set True to use a compact, curated feature set
+    USE_CURATED_FEATURES = True   # enable curated features
     CLIP_UNREALIZED_PNL = 2.0     # clip for unrealized pnl ratio feature
 
     # --- Early stopping ---
-    PATIENCE = 10  # stop if no new best for this many episodes
+    PATIENCE = 12  # allow more time to improve
 
 cfg = Config()
 device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -164,14 +181,15 @@ def load_and_build_features():
             df["atr_14"] = atr.average_true_range()
         # Volume z-score
         df["vol_z"] = ((df["Volume"] - df["Volume"].rolling(60).mean()) / (df["Volume"].rolling(60).std() + 1e-8)).fillna(0.0)
-        # Keep only curated features + Original_Close
+        # Keep curated features + OHLCV + Original_Close
         keep_cols = [c for c in df.columns if c in {
             "ret_1","ret_5","ret_15","ret_60","vol_30","rsi_14",
-            "macd","macd_signal","macd_hist","atr_14","vol_z","Original_Close","Close","High","Low","Open","Volume"
+            "macd","macd_signal","macd_hist","atr_14","vol_z",
+            "Original_Close","Close","High","Low","Open","Volume"
         }]
         df = df[keep_cols]
     else:
-        # Keep original features (Open/High/Low/Close/Volume) as-is + Original_Close
+        # Keep original OHLCV + Original_Close
         pass
 
     df.dropna(inplace=True)
@@ -386,12 +404,14 @@ class DuelingDQN(nn.Module):
                 module.reset_noise()
 
 # -------------------------------------------------
-# 3. DQN AGENT WITH N-STEP, SOFT TARGET, EMA
+# 3. DQN AGENT WITH N-STEP, SOFT/HARD TARGET, EMA, MASKED TARGETS, EPSILON
 # -------------------------------------------------
 class DQNAgent:
     def __init__(self, state_dim, action_dim):
         self.state_dim, self.action_dim = state_dim, action_dim
         self.beta, self.learn_step_counter = cfg.PER_BETA_START, 0
+        self.decision_steps = 0  # for epsilon schedule
+
         self.policy_net = DuelingDQN(state_dim, action_dim).to(device)
         self.target_net = DuelingDQN(state_dim, action_dim).to(device)
         self.ema_net = DuelingDQN(state_dim, action_dim).to(device)
@@ -401,11 +421,19 @@ class DQNAgent:
         self.target_net.eval()
         self.ema_net.eval()
 
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=cfg.LEARNING_RATE)
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY)
         self.memory = PrioritizedReplayMemory(cfg.MEMORY_CAPACITY)
 
         # N-step buffer for decision-level transitions
         self.nstep_buffer = deque(maxlen=cfg.N_STEP)
+
+    def current_epsilon(self):
+        t = min(self.decision_steps, cfg.EPS_ANNEAL_STEPS)
+        frac = t / max(cfg.EPS_ANNEAL_STEPS, 1)
+        return cfg.EPS_START + (cfg.EPS_END - cfg.EPS_START) * frac
+
+    def increment_decision_step(self):
+        self.decision_steps += 1
 
     def _soft_update(self, tau=None):
         if tau is None:
@@ -413,6 +441,9 @@ class DQNAgent:
         with torch.no_grad():
             for tp, sp in zip(self.target_net.parameters(), self.policy_net.parameters()):
                 tp.data.mul_(1.0 - tau).add_(tau * sp.data)
+
+    def _hard_update(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def _update_ema(self):
         with torch.no_grad():
@@ -424,16 +455,17 @@ class DQNAgent:
         last = state_np[-1]
         credit_ratio = float(last[-6])
         holdings_ratio = float(last[-5])
-        # Conservative mask on ratios so it's stable independent of absolute PV
         mask = np.ones(self.action_dim, dtype=bool)
-        # Actions: 0:HOLD, 1:BUY_25, 2:BUY_50, 3:SELL_25, 4:SELL_50, 5:SELL_100
+        # Actions: 0:HOLD, 1:BUY_25, 2:BUY_50, 3:BUY_75, 4:SELL_25, 5:SELL_50, 6:SELL_75, 7:SELL_100
         if credit_ratio < 0.01:
             mask[1] = False
             mask[2] = False
-        if holdings_ratio < 0.01:
             mask[3] = False
+        if holdings_ratio < 0.01:
             mask[4] = False
             mask[5] = False
+            mask[6] = False
+            mask[7] = False
         return mask
 
     def act(self, state, is_eval=False):
@@ -453,6 +485,12 @@ class DQNAgent:
         with torch.no_grad():
             s = torch.FloatTensor(state_np).unsqueeze(0).to(device)
             q_values = net(s).squeeze(0).cpu().numpy()
+
+        # epsilon-greedy on top of NoisyNets (only in training)
+        if not is_eval:
+            eps = self.current_epsilon()
+            if random.random() < eps:
+                return int(random.choice(valid_actions))
 
         q_values_masked = q_values.copy()
         q_values_masked[~mask] = -1e9
@@ -511,15 +549,31 @@ class DQNAgent:
 
         non_final_mask = torch.tensor([s is not None for s in next_states], device=device, dtype=torch.bool)
         if any(non_final_mask.cpu().numpy()):
-            non_final_next_states = torch.FloatTensor(np.array([s for s in next_states if s is not None])).to(device)
+            non_final_next_states_np = np.array([s for s in next_states if s is not None])
+            non_final_next_states = torch.FloatTensor(non_final_next_states_np).to(device)
         else:
             non_final_next_states = torch.empty((0,) + state_batch.shape[1:], device=device)
+            non_final_next_states_np = np.empty((0,))
 
         next_q_values = torch.zeros(cfg.BATCH_SIZE, device=device)
         if non_final_next_states.size(0) > 0:
             with torch.no_grad():
-                next_actions = self.policy_net(non_final_next_states).argmax(1).unsqueeze(1)
-                next_q_values[non_final_mask] = self.target_net(non_final_next_states).gather(1, next_actions).squeeze(1)
+                policy_q = self.policy_net(non_final_next_states)   # [N, A]
+                target_q = self.target_net(non_final_next_states)   # [N, A]
+
+                # Build action masks per next-state and apply to both policy_q and target_q
+                masks = np.stack([self._action_mask_from_state(s) for s in non_final_next_states_np], axis=0)  # [N, A]
+                masks_t = torch.tensor(masks, dtype=torch.bool, device=device)
+
+                # Mask invalid actions
+                very_neg = torch.full_like(policy_q, -1e9)
+                policy_q_masked = torch.where(masks_t, policy_q, very_neg)
+                target_q_masked = torch.where(masks_t, target_q, very_neg)
+
+                next_actions = policy_q_masked.argmax(dim=1, keepdim=True)  # [N,1]
+                next_q = target_q_masked.gather(1, next_actions).squeeze(1)  # [N]
+
+                next_q_values[non_final_mask] = next_q
 
         targets = reward_batch + (cfg.GAMMA ** cfg.N_STEP) * (1.0 - dones_tensor) * next_q_values
         q_values = self.policy_net(state_batch).gather(1, action_batch).squeeze(1)
@@ -530,15 +584,20 @@ class DQNAgent:
         loss = (is_weights * F.smooth_l1_loss(q_values, targets, reduction='none')).mean()
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 5.0)
         self.optimizer.step()
 
-        self._soft_update()
+        # Update target and EMA
+        if cfg.HARD_UPDATE_EVERY > 0 and (self.learn_step_counter % cfg.HARD_UPDATE_EVERY == 0):
+            self._hard_update()
+        else:
+            self._soft_update()
         self._update_ema()
+
         self.policy_net.reset_noise()
         self.target_net.reset_noise()
 
-    def save_model(self, path):
+    def save_model_full(self, path):
         to_save = {
             "policy": self.policy_net.state_dict(),
             "target": self.target_net.state_dict(),
@@ -546,22 +605,42 @@ class DQNAgent:
             "optimizer": self.optimizer.state_dict(),
         }
         torch.save(to_save, path)
-        print(f"Model saved to {path}")
+        print(f"Model (full) saved to {path}")
 
-    def load_model(self, path, strict=True):
+    def save_model_ema_only(self, path):
+        to_save = {
+            "ema": self.ema_net.state_dict()
+        }
+        torch.save(to_save, path)
+        print(f"EMA-only model saved to {path}")
+
+    def load_model(self, path, strict=True, ema_preferred=False):
         ckpt = torch.load(path, map_location=device)
+        # If ema-only checkpoint
+        if "policy" not in ckpt and "ema" in ckpt:
+            self.ema_net.load_state_dict(ckpt["ema"], strict=False)
+            # For consistency in inference, also load ema weights into policy/target
+            self.policy_net.load_state_dict(ckpt["ema"], strict=False)
+            self.target_net.load_state_dict(ckpt["ema"], strict=False)
+            print(f"EMA-only model loaded from {path}")
+            return
+        # Full checkpoint
         self.policy_net.load_state_dict(ckpt["policy"], strict=strict)
         self.target_net.load_state_dict(ckpt.get("target", ckpt["policy"]), strict=False)
         self.ema_net.load_state_dict(ckpt.get("ema", ckpt["policy"]), strict=False)
         if "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                if not ema_preferred:
+                    self.optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception:
+                pass
         print(f"Model loaded from {path}")
 
 # -------------------------------------------------
-# 4. TRADING ENVIRONMENT
+# 4. TRADING ENVIRONMENT (UPDATED ACTIONS & REWARD)
 # -------------------------------------------------
 class TradingEnvironment:
-    # Actions: 0:HOLD, 1:BUY_25, 2:BUY_50, 3:SELL_25, 4:SELL_50, 5:SELL_100
+    # Actions: 0:HOLD, 1:BUY_25, 2:BUY_50, 3:BUY_75, 4:SELL_25, 5:SELL_50, 6:SELL_75, 7:SELL_100
     def __init__(self, data, initial_credit=cfg.INITIAL_CREDIT, window_size=cfg.WINDOW_SIZE,
                  decision_frequency_minutes=1, force_liquidation_on_done=True):
         self.data = data
@@ -570,7 +649,7 @@ class TradingEnvironment:
         self.window_size = window_size
         # We append 6 portfolio features at the end
         self.n_features = self.normalized_data.shape[1] + 6
-        self.action_space = [0, 1, 2, 3, 4, 5]
+        self.action_space = [0, 1, 2, 3, 4, 5, 6, 7]
         self.n_actions = len(self.action_space)
         self.decision_frequency_minutes = max(int(decision_frequency_minutes), 1)
         self.cooldown_ticks = max(1, math.ceil(cfg.ACTION_COOLDOWN_MINUTES / self.decision_frequency_minutes))
@@ -588,6 +667,7 @@ class TradingEnvironment:
         self.trades = []
         self.steps_in_position = 0
         self.cooldown = 0  # in decision ticks
+        self.idle_decision_count = 0  # count consecutive decision ticks with holdings==0 and no trade
         initial_price = self.data["Original_Close"].iloc[self.current_step - 1]
         self.max_portfolio_value = self.credit + self.holdings * initial_price
         self.prev_drawdown = 0.0
@@ -612,7 +692,7 @@ class TradingEnvironment:
         # Clip unrealized pnl for stability
         unrealized_pnl_ratio = float(np.clip(unrealized_pnl_ratio, -cfg.CLIP_UNREALIZED_PNL, cfg.CLIP_UNREALIZED_PNL))
         time_in_pos_norm = math.log(self.steps_in_position + 1) / 5.0
-        # Absolute-normalized (by start PV) portfolio scalars for more stable masks (not used directly in mask here)
+        # Absolute-normalized (by start PV) portfolio scalars
         credit_norm = self.credit / max(self.start_pv, 1e-8)
         holdings_value_norm = (self.holdings * current_price) / max(self.start_pv, 1e-8)
         portfolio_state = np.array([[credit_ratio, holdings_ratio, unrealized_pnl_ratio, time_in_pos_norm, credit_norm, holdings_value_norm]] * self.window_size)
@@ -631,18 +711,25 @@ class TradingEnvironment:
         realized_pnl, trade_executed = 0.0, False
         buy_fraction, sell_fraction = 0.0, 0.0
 
+        # Map actions to fractions
         if action == 1:
             buy_fraction = 0.25
         elif action == 2:
             buy_fraction = 0.50
         elif action == 3:
-            sell_fraction = 0.25
+            buy_fraction = 0.75
         elif action == 4:
-            sell_fraction = 0.50
+            sell_fraction = 0.25
         elif action == 5:
+            sell_fraction = 0.50
+        elif action == 6:
+            sell_fraction = 0.75
+        elif action == 7:
             sell_fraction = 1.00
 
         pv_before = self.credit + self.holdings * current_price
+        credit_before = self.credit
+        holdings_value_before = self.holdings * current_price
 
         buy_notional = 0.0
         sell_notional = 0.0
@@ -668,15 +755,20 @@ class TradingEnvironment:
             invest_I = min(desired_I, I_max)
             if invest_I > cfg.MIN_TRADE_CREDIT_BUY and invest_I > 0.0:
                 buy_fee = invest_I * f
-                buy_amount_asset = (invest_I * (1.0 - f)) / current_price
-                # Update weighted average buy price with proper cost basis
-                total_cost_excl_fees = (self.average_buy_price * self.holdings) + invest_I
-                self.holdings += buy_amount_asset
+                # Net currency spent on asset excluding fees
+                net_used_for_asset = invest_I * (1.0 - f)
+                buy_amount_asset = net_used_for_asset / current_price
+                # Update weighted average buy price EXCLUDING FEES (unit-weighted by price)
+                prev_units = self.holdings
+                prev_cost_excl_fees = self.average_buy_price * prev_units
+                new_units = prev_units + buy_amount_asset
+                new_cost_excl_fees = prev_cost_excl_fees + (buy_amount_asset * current_price)
+                self.holdings = new_units
+                self.average_buy_price = (new_cost_excl_fees / new_units) if new_units > 0 else 0.0
+
+                # Deduct credit by the full invest_I (fees + asset)
                 self.credit -= invest_I
-                if self.holdings > 0:
-                    self.average_buy_price = total_cost_excl_fees / self.holdings
-                else:
-                    self.average_buy_price = 0.0
+
                 self.trades.append({"step": self.current_step, "type": "buy", "price": current_price, "amount": buy_amount_asset})
                 trade_executed = True
                 buy_notional = invest_I
@@ -691,6 +783,7 @@ class TradingEnvironment:
                 sell_value = gross_value - sell_fee
                 self.credit += sell_value
                 self.holdings -= sell_amount_asset
+                # Realized PnL based on cost basis (excluding fees)
                 realized_pnl = (current_price - self.average_buy_price) * sell_amount_asset
                 if self.holdings < 1e-9:
                     self.holdings = 0.0
@@ -704,14 +797,22 @@ class TradingEnvironment:
         if trade_executed and decision_tick:
             self.cooldown = self.cooldown_ticks
             self.steps_in_position = 0
+            self.idle_decision_count = 0
         elif self.holdings > 0:
             self.steps_in_position += 1
+            if decision_tick:
+                self.idle_decision_count = 0
+        else:
+            if decision_tick:
+                # holdings == 0 and no trade executed
+                self.idle_decision_count += 1
 
         # Advance time
         self.current_step += 1
         done = self.current_step >= len(self.data) - 1
 
         pv_after = self.credit + self.holdings * next_price
+        credit_after = self.credit
         if pv_after > self.max_portfolio_value:
             self.max_portfolio_value = pv_after
 
@@ -724,6 +825,7 @@ class TradingEnvironment:
             self.credit += liquidate_value
             self.trades.append({"step": self.current_step, "type": "sell", "price": next_price, "amount": self.holdings})
             pv_after = self.credit
+            credit_after = self.credit
             fees_step += liq_fee
             sell_notional += gross_liq
             self.holdings = 0.0
@@ -734,8 +836,11 @@ class TradingEnvironment:
         self.total_buy_notional += buy_notional
         self.total_sell_notional += sell_notional
 
-        # Reward calculation (log PV return centric; scaled and clipped)
-        reward, comps = self._calculate_reward(realized_pnl, pv_before, pv_after, trade_executed, fees_step)
+        # Reward calculation (credit growth and log-PV return centric; scaled and clipped)
+        reward, comps = self._calculate_reward(
+            realized_pnl, pv_before, pv_after, credit_before, credit_after,
+            trade_executed, fees_step, decision_tick
+        )
 
         next_state = self._get_state() if not done else None
 
@@ -752,13 +857,21 @@ class TradingEnvironment:
         }
         return next_state, reward, done, info
 
-    def _calculate_reward(self, realized_pnl, pv_before, pv_after, trade_executed, fees_step):
+    def _calculate_reward(self, realized_pnl, pv_before, pv_after, credit_before, credit_after,
+                          trade_executed, fees_step, decision_tick):
         # Core: scaled log return on PV (encourages multiplicative growth)
         log_ret = math.log(max(pv_after, 1e-8) / max(pv_before, 1e-8))
         pv_component = cfg.PV_LOGRET_SCALE * log_ret
 
-        # Realized PnL shaping (normalize by start PV)
-        realized_component = cfg.REWARD_REALIZED * (realized_pnl / max(self.start_pv, 1e-8)) if realized_pnl != 0 else 0.0
+        # Direct credit growth component (normalize by start PV)
+        d_credit = credit_after - credit_before
+        credit_component = cfg.CREDIT_GAIN_W * (d_credit / max(self.start_pv, 1e-8))
+        credit_component = float(np.clip(credit_component, -cfg.CREDIT_CLIP, cfg.CREDIT_CLIP))
+
+        # Realized PnL asymmetric shaping (normalize by start PV)
+        realized_gain = max(realized_pnl, 0.0) / max(self.start_pv, 1e-8)
+        realized_loss = max(-realized_pnl, 0.0) / max(self.start_pv, 1e-8)
+        realized_component = cfg.REALIZED_GAIN_W * realized_gain - cfg.REALIZED_LOSS_W * realized_loss
         realized_component = float(np.clip(realized_component, -cfg.REALIZED_CLIP, cfg.REALIZED_CLIP))
 
         # Trade penalty
@@ -780,13 +893,20 @@ class TradingEnvironment:
         fees_pen = -cfg.FEES_PENALTY_COEF * (fees_step / max(self.start_pv, 1e-8)) if fees_step > 0 else 0.0
         fees_pen = float(np.clip(fees_pen, -cfg.FEES_CLIP, cfg.FEES_CLIP))
 
+        # Idle-cash penalty: if staying idle with zero holdings for too many decision ticks
+        idle_cash_pen = 0.0
+        if decision_tick and (self.holdings <= 0.0) and (not trade_executed) and (self.idle_decision_count > cfg.IDLE_AFTER_DECISIONS):
+            idle_cash_pen = -cfg.IDLE_CASH_PENALTY
+
         comps = {
             "pv_logret": pv_component,
+            "credit": credit_component,
             "realized": realized_component,
             "trade_pen": trade_pen,
             "time_pen": time_pen,
             "dd_pen": dd_pen,
-            "fees_pen": fees_pen
+            "fees_pen": fees_pen,
+            "idle_pen": idle_cash_pen
         }
         reward = float(np.clip(sum(comps.values()), -cfg.REWARD_CLIP, cfg.REWARD_CLIP))
         return reward, comps
@@ -794,8 +914,8 @@ class TradingEnvironment:
 # -------------------------------------------------
 # 5. PLOTTING
 # -------------------------------------------------
-def plot_results(df, episode, portfolio_history, credit_history, holdings_history, trades, plot_title_prefix="", segment_boundaries=None, save_name=None):
-    os.makedirs("plots", exist_ok=True)
+def plot_results(df, episode, portfolio_history, credit_history, holdings_history, trades, plot_title_prefix="", segment_boundaries=None, save_name=None, out_dir="plots"):
+    os.makedirs(out_dir, exist_ok=True)
     aligned = len(portfolio_history) == len(df)
     if aligned:
         plot_df = df.copy()
@@ -859,11 +979,22 @@ def plot_results(df, episode, portfolio_history, credit_history, holdings_histor
     fig.show()
     if save_name is None:
         save_name = f"{plot_title_prefix.lower()}_episode_{episode}.html"
-    fig.write_html(os.path.join("plots", save_name), auto_open=False)
+    fig.write_html(os.path.join(out_dir, save_name), auto_open=False)
 
 # -------------------------------------------------
-# 6. TRAINING AND EVALUATION LOGIC
+# 6. TRAINING AND EVALUATION LOGIC (UPDATED SELECTION)
 # -------------------------------------------------
+def action_entropy(action_counts):
+    total = sum(action_counts.values())
+    if total == 0:
+        return 0.0
+    ent = 0.0
+    for c in action_counts.values():
+        if c > 0:
+            p = c / total
+            ent -= p * math.log(p + 1e-12)
+    return ent
+
 def run_episode(env, agent, data, is_eval=False, initial_credit=None, initial_holdings=0.0, initial_avg_buy_price=0.0, decision_frequency_minutes=15, force_liq_on_done=True):
     env.decision_frequency_minutes = max(1, int(decision_frequency_minutes))
     env.cooldown_ticks = max(1, math.ceil(cfg.ACTION_COOLDOWN_MINUTES / env.decision_frequency_minutes))
@@ -878,7 +1009,7 @@ def run_episode(env, agent, data, is_eval=False, initial_credit=None, initial_ho
     pbar = tqdm(total=total_steps, desc=pbar_desc, leave=False)
 
     action_counts = defaultdict(int)
-    comp_sums = {"pv_logret": 0.0, "realized": 0.0, "trade_pen": 0.0, "time_pen": 0.0, "dd_pen": 0.0, "fees_pen": 0.0}
+    comp_sums = {"pv_logret": 0.0, "credit": 0.0, "realized": 0.0, "trade_pen": 0.0, "time_pen": 0.0, "dd_pen": 0.0, "fees_pen": 0.0, "idle_pen": 0.0}
     fees_total = 0.0
     buy_notional_total = 0.0
     sell_notional_total = 0.0
@@ -896,7 +1027,6 @@ def run_episode(env, agent, data, is_eval=False, initial_credit=None, initial_ho
         if decision_tick:
             # Push previous aggregated decision transition (n-step builder inside agent)
             if not is_eval and last_decision_state is not None:
-                # Store the just-finished (s,a,R,next_s,done)
                 pushed = agent.store_transition(last_decision_state, last_decision_action, aggregated_reward, state, False)
                 if pushed is not None:
                     # After pushing, run K gradient updates
@@ -904,6 +1034,8 @@ def run_episode(env, agent, data, is_eval=False, initial_credit=None, initial_ho
                         agent.learn()
             # Choose new action at decision tick
             action = agent.act(state, is_eval)
+            if not is_eval:
+                agent.increment_decision_step()
             action_counts[action] += 1
             last_decision_state = state
             last_decision_action = action
@@ -1048,8 +1180,16 @@ def validate_in_segments(full_val_data, agent, window_size, initial_credit, deci
 
     return all_portfolio, all_credit, all_holdings, all_trades, segment_metrics, segment_boundaries
 
+def robust_credit_score(seg_metrics):
+    if not seg_metrics:
+        return -1e9
+    cg_list = [m["credit_growth"] for m in seg_metrics]
+    cg_arr = np.array(cg_list, dtype=np.float64)
+    # robust score = median segment credit growth
+    return float(np.nanmedian(cg_arr))
+
 # -------------------------------------------------
-# 7. MAIN EXECUTION
+# 7. MAIN EXECUTION (UPDATED SELECTION & RANDOM START POSITIONS)
 # -------------------------------------------------
 def main():
     print(f"Using device: {device}")
@@ -1067,9 +1207,26 @@ def main():
     dummy_env = TradingEnvironment(train_data)
     agent = DQNAgent(state_dim=dummy_env.n_features, action_dim=dummy_env.n_actions)
 
-    os.makedirs("saved_models", exist_ok=True)
-    best_val_pv_return = -1e9
+    # Create unique run directories
+    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    models_dir = os.path.join("saved_models", run_name)
+    plots_dir = os.path.join("plots", run_name)
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Symlink/copy path to the "current best" EMA-only checkpoint
+    best_symlink_path = os.path.join("saved_models", "best_model.pth")
+    if os.path.exists(best_symlink_path):
+        try:
+            os.remove(best_symlink_path)
+        except Exception:
+            pass
+
+    best_score = -1e9
     patience_counter = 0
+
+    # Maintain top-k EMAs by robust credit score
+    top_models = []  # list of dicts: {"score": float, "ema_path": str, "full_path": str, "tag": str}
 
     for e in range(cfg.EPISODES):
         print(f"\n=== Episode {e + 1}/{cfg.EPISODES} ===")
@@ -1086,14 +1243,34 @@ def main():
         # Single fixed cadence for stability
         train_decision_freq = cfg.TRAIN_DECISION_FREQUENCIES[0]
 
+        # Randomize starting inventory in some episodes to teach management/exit
+        rnd_pos = (random.random() < 0.4)
+        start_price = episode_data["Original_Close"].iloc[cfg.WINDOW_SIZE - 1]
+        if rnd_pos:
+            u = random.uniform(0.0, cfg.MAX_EXPOSURE)  # exposure fraction
+            init_holdings_value = u * cfg.INITIAL_CREDIT
+            init_holdings_units = init_holdings_value / max(start_price, 1e-8)
+            init_credit = (1.0 - u) * cfg.INITIAL_CREDIT
+            init_avg_buy_price = start_price
+        else:
+            init_holdings_units = 0.0
+            init_credit = cfg.INITIAL_CREDIT
+            init_avg_buy_price = 0.0
+
         train_env = TradingEnvironment(episode_data, window_size=cfg.WINDOW_SIZE, decision_frequency_minutes=train_decision_freq)
         (
             _pv, _cred, _hold, _idx, _trades,
             _fpv, _fcred, _fhold, _favgbp, action_counts, _c_sums, _fees, _buy_not, _sell_not
         ) = run_episode(
-            train_env, agent, episode_data, is_eval=False, initial_credit=cfg.INITIAL_CREDIT,
+            train_env, agent, episode_data, is_eval=False,
+            initial_credit=init_credit, initial_holdings=init_holdings_units, initial_avg_buy_price=init_avg_buy_price,
             decision_frequency_minutes=train_decision_freq, force_liq_on_done=True
         )
+
+        # Diagnostics
+        ent = action_entropy(action_counts)
+        hold_share = action_counts.get(0, 0) / max(sum(action_counts.values()), 1)
+        print(f"Action entropy (train): {ent:.3f} | HOLD share: {hold_share:.2%}")
 
         print("\n-> Validation phase…")
         val_freq = cfg.VAL_DECISION_FREQUENCY
@@ -1107,52 +1284,94 @@ def main():
             print(
                 f"  Seg {m['seg']:02d} [{m['start']} → {m['end']}]  "
                 f"PV: ${m['final_pv']:.2f} (Ret: {m['ret']:.2f}%, LogRet: {m['logret_pct']:.2f}%) | "
-                f"Credit: ${m['final_credit']:.2f} (Growth: {m['credit_growth']:.2f}%) | "
+                f"Credit: ${m['final_credit']:.2f} (Segment Credit Growth: {m['credit_growth']:.2f}%) | "
                 f"Buys: {m['buys']}, Sells: {m['sells']} | "
                 f"Fees: ${m['fees_total']:.2f}, Turnover(B/S): ${m['turnover_buy']:.2f}/${m['turnover_sell']:.2f} | "
-                f"Rewards Σ: pv_logret={rc['pv_logret']:.4f}, realized={rc['realized']:.4f}, trade_pen={rc['trade_pen']:.4f}, "
-                f"dd_pen={rc['dd_pen']:.4f}, fees_pen={rc['fees_pen']:.4f}, time_pen={rc['time_pen']:.4f}"
+                f"Rewards Σ: pv_logret={rc['pv_logret']:.4f}, credit={rc['credit']:.4f}, realized={rc['realized']:.4f}, "
+                f"trade_pen={rc['trade_pen']:.4f}, dd_pen={rc['dd_pen']:.4f}, fees_pen={rc['fees_pen']:.4f}, idle_pen={rc['idle_pen']:.4f}, time_pen={rc['time_pen']:.4f}"
             )
 
-        if seg_metrics:
-            total_final_credit = seg_metrics[-1]["final_credit"]
-            total_initial_credit = cfg.INITIAL_CREDIT
-            cumulative_val_return = (total_final_credit - total_initial_credit) / total_initial_credit * 100.0
-            mean_seg_logret_pct = float(np.mean([m["logret_pct"] for m in seg_metrics]))
+        # Robust model selection: use median segment credit growth
+        score = robust_credit_score(seg_metrics)
+        print(f"\nRobust score (median segment credit growth): {score:.2f}%")
 
-            improved = cumulative_val_return > best_val_pv_return
-            if improved:
-                best_val_pv_return = cumulative_val_return
-                patience_counter = 0
-                agent.save_model(f"saved_models/best_model.pth")
-                print(f"New best validation cumulative PV return: {best_val_pv_return:.2f}%. Model saved.")
-            else:
-                patience_counter += 1
-                print(f"No improvement. Patience {patience_counter}/{cfg.PATIENCE}.")
+        improved = score > (best_score + cfg.IMPROVEMENT_MARGIN)
+        if improved:
+            best_score = score
+            patience_counter = 0
 
-            total_buys = sum(m["buys"] for m in seg_metrics)
-            total_sells = sum(m["sells"] for m in seg_metrics)
+        # Always consider adding to top-k if score qualifies
+        tag = f"ep{e+1:02d}_robust{score:+.2f}"
+        full_path = os.path.join(models_dir, f"candidate_{tag}_full.pth")
+        ema_path = os.path.join(models_dir, f"candidate_{tag}_ema.pth")
+        agent.save_model_full(full_path)
+        agent.save_model_ema_only(ema_path)
 
-            print("\nAggregated validation:")
-            print(f"  Cumulative PV return: {cumulative_val_return:.2f}%")
-            print(f"  Mean segment PV log-return: {mean_seg_logret_pct:.2f}%")
-            print(f"  Total buys: {total_buys}, Total sells: {total_sells}")
+        # Insert into top-k (keep highest scores)
+        top_models.append({"score": score, "ema_path": ema_path, "full_path": full_path, "tag": tag})
+        top_models = sorted(top_models, key=lambda x: x["score"], reverse=True)[:cfg.TOP_K_MODELS]
 
-            if any(np.isfinite(v) for v in pv_hist):
-                plot_results(
-                    val_data, e + 1, pv_hist, credit_hist, hold_hist, trades,
-                    "Validation", segment_boundaries=seg_boundaries, save_name=f"val_episode_{e+1}.html"
-                )
+        # Update symlink/copy for global best
+        if top_models and top_models[0]["ema_path"]:
+            best_ema_checkpoint_path = top_models[0]["ema_path"]
+            try:
+                if os.path.islink(best_symlink_path):
+                    os.remove(best_symlink_path)
+                os.symlink(os.path.abspath(best_ema_checkpoint_path), best_symlink_path)
+            except Exception:
+                shutil.copy2(best_ema_checkpoint_path, best_symlink_path)
 
-            if patience_counter >= cfg.PATIENCE:
-                print("Early stopping due to no improvement.")
-                break
+            print(f"Top-1 updated: {top_models[0]['tag']} | Score: {top_models[0]['score']:.2f}%")
 
-    print("\n=== FINAL TEST ON UNSEEN DATA ===")
+        if not improved:
+            patience_counter += 1
+            print(f"No new top-1 improvement. Patience {patience_counter}/{cfg.PATIENCE}.")
+
+        total_buys = sum(m["buys"] for m in seg_metrics)
+        total_sells = sum(m["sells"] for m in seg_metrics)
+        median_credit_growth = robust_credit_score(seg_metrics)
+        cumulative_val_pv_return = (seg_metrics[-1]["final_pv"] - cfg.INITIAL_CREDIT) / cfg.INITIAL_CREDIT * 100.0 if seg_metrics else float('nan')
+
+        print("\nAggregated validation:")
+        print(f"  Median segment credit growth: {median_credit_growth:.2f}%")
+        print(f"  Cumulative PV return (end-to-end PV): {cumulative_val_pv_return:.2f}%")
+        print(f"  Total buys: {total_buys}, Total sells: {total_sells}")
+
+        if any(np.isfinite(v) for v in pv_hist):
+            plot_results(
+                val_data, e + 1, pv_hist, credit_hist, hold_hist, trades,
+                "Validation", segment_boundaries=seg_boundaries, save_name=f"val_episode_{e+1}.html", out_dir=plots_dir
+            )
+
+        if patience_counter >= cfg.PATIENCE:
+            print("Early stopping due to no improvement on top-1.")
+            break
+
+    # -------------------------------------------------
+    # After training: load best EMA checkpoint, re-run validation plot and test
+    # -------------------------------------------------
+    print("\n=== RELOADING BEST CHECKPOINT FOR FINAL EVAL ===")
+    # Determine best path
+    load_path = top_models[0]["ema_path"] if top_models else best_symlink_path
     try:
-        agent.load_model("saved_models/best_model.pth", strict=False)
+        agent.load_model(load_path, strict=False, ema_preferred=True)
     except Exception as e:
-        print("No saved model found or failed to load; using current policy.")
+        print(f"Failed to load best checkpoint ({load_path}). Using current policy. Error: {e}")
+
+    # Best Validation plot
+    print("\n=== BEST CHECKPOINT VALIDATION PLOT ===")
+    pv_hist, credit_hist, hold_hist, trades, seg_metrics, seg_boundaries = validate_in_segments(
+        val_data, agent, window_size=cfg.WINDOW_SIZE, initial_credit=cfg.INITIAL_CREDIT, decision_frequency_minutes=cfg.VAL_DECISION_FREQUENCY
+    )
+    if any(np.isfinite(v) for v in pv_hist):
+        plot_results(
+            val_data, "Best", pv_hist, credit_hist, hold_hist, trades,
+            "Best Validation", segment_boundaries=seg_boundaries, save_name="best_validation.html", out_dir=plots_dir
+        )
+    print(f"Best model robust score (median segment credit growth): {robust_credit_score(seg_metrics):.2f}%")
+
+    # Final Test
+    print("\n=== FINAL TEST ON UNSEEN DATA ===")
     test_env = TradingEnvironment(test_data.reset_index(drop=True), decision_frequency_minutes=cfg.VAL_DECISION_FREQUENCY)
     (
         pv, cred, hold, idx_hist, trades, final_pv, final_credit, final_holdings, final_avg_buy_price,
@@ -1180,9 +1399,11 @@ def main():
         print(f"Final PV: ${final_pv:,.2f} (Return: {pv_return:.2f}%)")
         print(f"Final Credit: ${final_credit:,.2f} (Return: {credit_return:.2f}%)")
         print(f"Total Buys: {buys}, Total Sells: {sells}")
-        print(f"Fees paid: ${fees_total:.2f}, Turnover(B/S): ${buy_not:.2f}/{sell_not:.2f}")
+        print(f"Fees paid: ${fees_total:.2f}, Turnover(B/S): ${buy_not:.2f}/${sell_not:.2f}")
         print(f"Reward components Σ (test): {json.dumps({k: round(v, 6) for k, v in comp_sums.items()})}")
-        plot_results(test_data, "Final", full_pv, full_cred, full_hold, trades, "Final Test", segment_boundaries=None, save_name="final_test.html")
+        plot_results(test_data, "Best", full_pv, full_cred, full_hold, trades, "Best Test", segment_boundaries=None, save_name="best_test.html", out_dir=plots_dir)
+    else:
+        print("No test PV history produced.")
 
 if __name__ == "__main__":
     main()
