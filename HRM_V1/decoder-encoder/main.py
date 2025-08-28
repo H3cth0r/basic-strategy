@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import pandas as pd
 
 import math
 import random
@@ -15,30 +16,31 @@ SEED = 42
 random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Responsible for converting text into a sequence of numbers (integers) and back
-# Operates at the character level, meaning each character becomes a unique token
+# Tokenizer 
+# Neural network cannot understand raw text. It only understands
+# numbers. A tokenizer's job is to convert text into a sequence of numbers
+# called tokenization or encoding. Then it will convert sequence back into 
+# human readable text (decoding). This tokenization works at the character
+# lelve, meaning each character gets a unique number.
 class CharTokenizer:
-    """
-    Manages the vocabulary and conversion between cahracters and Integer IDs.
-    """
     def __init__(self, texts: List[str], lower: bool=True, min_freq: int=1):
         """
-        Initializes the tokenizer and builds the vocabulary.
-        Args:
-            texts: list of sentences to build the vocabulary from.
-            lower(bool): if true, all text will be converted to lowercase.
-            min_freq: minimum frequency a character must have to be included in the vocabulary.
+        texts (List[str]): list of sequences to build the vocabulary from.
+        lower (bool): if true, all text is converted to lowercase
+        min_freq (int): minimum number of times a character must appear to be included in the vocab
         """
-        # Definition of tokens that have specific meanings
-        self.lower  = lower
-        self.PAD    = "<pad>"   # Padding token: used to make all sequences in a batch the same length
-        self.SOS    = "<s>"     # Start of sentence token: marks the beginning of a sequence
-        self.EOS    = "</s>"    # end of sentence token: marks the end of a sequence
-        self.UNK    = "<unk>"   # represents any character not in vocab
+        self.lower = lower
         
-        # build vocab from characters (no whitespace splitting)
+        # these tokens have special meanings and are essential for the model.
+        self.PAD = "<pad>"      # Padding Token: Used to make all sequences in a batch the same length.
+        self.SOS = "<s>"        # Start-of-Sequence: Marks the beginning of a sentence.
+        self.EOS = "</s>"       # End-of-Sequence: Marks the end of a sentence.
+        self.UNK = "<unk>"      # Unknown Token: Represents any character not in our vocabulary.
+
+        # --- Building the Vocabulary ---
+        # count character frequencies.
         freq = {}
         for t in texts:
             if t is None: continue
@@ -46,62 +48,22 @@ class CharTokenizer:
             for ch in s:
                 freq[ch] = freq.get(ch, 0) + 1
 
-        print(freq)
-        # Special tokens first
+        # create itos (integer-to-string) mapping. This is a list where the
+        #    index is the ID and the value is the character.
         self.itos = [self.PAD, self.SOS, self.EOS, self.UNK]
-        # Add chars by frequency
+        # sort characters by frequency (most common first) to build a robust vocabulary.
         chars = [c for c, f in sorted(freq.items(), key=lambda x: (-x[1], x[0])) if f >= min_freq]
-        print(chars)
-        # for c in chars:
-        #     if c not in self.itos:
-        #         self.itos.append(c)
-        self.itos += chars
-        print(self.itos)
+        self.itos += [c for c in chars if c not in self.itos]
 
+        # create stoi (string-to-integer) mapping. This is a dictionary for
+        #    fast lookups of a character's ID.
         self.stoi = {s: i for i, s in enumerate(self.itos)}
-        print(self.stoi)
-        self.pad_id = self.stoi[self.PAD]
-        self.sos_id = self.stoi[self.SOS]
-        self.eos_id = self.stoi[self.EOS]
-        self.unk_id = self.stoi[self.UNK]
-        print(self.pad_id)
 
-class TranslationPairDataset(torch.utils.data.Dataset):
-    def __init__(
-            self,
-            pairs: List[Tuple[str, str]],
-            src_tok: CharTokenizer,
-            tgt_tok: CharTokenizer,
-            max_src_len: int = 140,
-            max_tgt_len: int = 140,
-    ):
-        self.data       = pairs
-        self.src_tok    = src_tok
-        self.tgt_tok    = tgt_tok
-        self.max_src_len=max_src_len
-        self.max_tgt_len=max_tgt_len
-
-def collate_batch(batch, pad_src: int, pad_tgt: int):
-    src_seqs, tgt_seqs = zip(*batch)
+        # we store the integer IDs of special tokens for easy access later. For example,
+        # when we need to pad a batch, we can directly use self.pad_id.
+        self.pad_id = self.stoi[self.PAD] # The ID for the padding token.
+        self.sos_id = self.stoi[self.SOS] # The ID for the start-of-sequence token.
+        self.eos_id = self.stoi[self.EOS] # The ID for the end-of-sequence token.
+        self.unk_id = self.stoi[self.UNK] # The ID for the unknown token.
 
 def main():
-    ds = load_dataset("bentrevett/multi30k")
-    df_train        = ds["train"].to_pandas()
-    df_validation   = ds["validation"].to_pandas()
-
-    src_texts = df_train["en"]
-    tgt_texts = df_train["de"]
-
-    print(src_texts)
-    print(tgt_texts)
-
-    src_tok = CharTokenizer(src_texts, lower=True, min_freq=1)
-    tgt_tok = CharTokenizer(tgt_texts, lower=True, min_freq=1)
-
-    max_src_len = 140
-    max_tgt_len = 140
-    train_ds    = TranslationPairDataset(df_train, src_tok, tgt_tok, max_src_len, max_tgt_len)
-    valid_ds    = TranslationPairDataset(df_validation, src_tok, tgt_tok, max_src_len, max_tgt_len)
-
-if __name__ == "__main__":
-    main()
