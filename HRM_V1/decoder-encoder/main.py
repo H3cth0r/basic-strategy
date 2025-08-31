@@ -296,14 +296,191 @@ class Decoder(nn.Module):
 
     def forward_step(self, x_t, hidden, enc_outputs, src_mask):
         """ Performs a single decoding step. """
+        # =====================================================================
+        # Step 0: The Inputs for this Timestep
+        # =====================================================================
+        # x_t: The input token for this specific step. At the first step, this is
+        #      the `<s>` (SOS) token. At later steps, it's the token generated
+        #      in the previous step.
+        #      Shape: [Batch_Size] -> [1] (containing a single token ID)
+        #
+        # hidden: The decoder's RNN hidden state from the PREVIOUS step.
+        #         This is our "memory" of what we've translated so far.
+        #         Shape: [Batch_Size, Hidden_Dim] -> [1, 256]
+        #
+        # enc_outputs: ALL hidden states from the encoder. This never changes
+        #              during the decoding of a single sentence.
+        #              Shape: [Batch_Size, Src_Len, Hidden_Dim] -> [1, 5, 256]
+        #
+        # src_mask: The padding mask for the source sentence.
+        #           Shape: [Batch_Size, Src_Len] -> [1, 5]
+        # =====================================================================
+
+        # =====================================================================
+        # Step 1: Embed the Input Token
+        # =====================================================================
+        # Convert the token ID into a dense vector representation.
+        # Note: self.embedding expects a tensor of shape (Batch, SeqLen), so
+        # we unsqueeze to add a temporary sequence length of 1, which we later remove.
+        # The provided code simplifies this, but under the hood, this is what happens.
+        # For simplicity, we'll assume the embedding layer handles a [Batch_Size] input.
         emb = self.dropout(self.embedding(x_t))
-        # calculate the attention to get the context vector for this timestep
+        #
+        # DATA AT THIS STEP (`emb`): The vector for the current input character.
+        # Shape: [Batch_Size, Emb_Dim] -> [1, 128] (assuming emb_dim=128)
+        # =====================================================================
+
+        # =====================================================================
+        # Step 2: GET THE ATTENTION CONTEXT (The Magic Happens Here)
+        # =====================================================================
+        # We call our attention module. Notice the mapping:
+        #   - The `query` is the decoder's previous `hidden` state.
+        #   - The `keys` are the `enc_outputs`.
+        #   - The `mask` is the `src_mask`.
         context, attn = self.attn(hidden, enc_outputs, src_mask)
+        #
+        # DATA AT THIS STEP:
+        # `context`: A summary of the source sentence, tailored to this step.
+        #            Shape: [Batch_Size, Hidden_Dim] -> [1, 256]
+        # `attn`: The attention weights for visualization.
+        #         Shape: [Batch_Size, Src_Len] -> [1, 5]
+        # =====================================================================
+
+        # =====================================================================
+        # Step 3: Combine and Feed to the RNN
+        # =====================================================================
+        # We provide the RNN with two pieces of information:
+        # 1. The current character we're looking at (`emb`).
+        # 2. The relevant context from the source sentence (`context`).
+        # We concatenate them into a single, richer input vector.
         rnn_in = torch.cat([emb, context], dim=-1).unsqueeze(1)
+        #
+        # DATA AT THIS STEP (`rnn_in`): The combined vector.
+        # Shape: [Batch_Size, Seq_Len, Emb_Dim + Hidden_Dim] -> [1, 1, 128 + 256]
+        # The `unsqueeze(1)` is to give it a sequence length of 1, as RNNs expect
+        # a 3D tensor: (Batch, Seq_Len, Input_Dim).
+        # =====================================================================
+
+        # =====================================================================
+        # Step 4: Update the Decoder State with the RNN
+        # =====================================================================
+        # The GRU processes the combined input (`rnn_in`) and the previous
+        # hidden state (`hidden`) to produce a new output and a new hidden state.
         out, h_new = self.rnn(rnn_in, hidden.unsqueeze(0))
-        # The final output is a combination of the RNN output and the attention context
-        logits = self.fc_out(torch.cat([out.squeeze(1), context], dim=-1))
+        # DATA AT THIS STEP:
+        # `out`: The output of the GRU at this timestep.
+        #        Shape: [Batch_Size, Seq_Len, Hidden_Dim] -> [1, 1, 256]
+        # `h_new`: The NEW hidden state for the decoder. This becomes the `hidden`
+        #          input for the *next* timestep. This is how memory is passed.
+        #          Shape: [Num_Layers, Batch_Size, Hidden_Dim] -> [1, 1, 256]
+        # We squeeze them to remove the sequence/layer dimensions.
+        # =====================================================================
+
+        # =====================================================================
+        # Step 5: Make a Prediction
+        # =====================================================================
+        # We concatenate the RNN output (`out`) and the attention context (`context`)
+        # one last time before feeding it to the final linear layer (`fc_out`).
+        # This gives the final layer maximum information to make a good prediction.
+        pred_input = torch.cat([out.squeeze(1), context], dim=-1)
+        # Shape of `pred_input`: [Batch_Size, Hidden_Dim + Hidden_Dim] -> [1, 512]
+        
+        logits = self.fc_out(pred_input)
+        #
+        # DATA AT THIS STEP (`logits`): Raw scores for every character in the
+        # target vocabulary. The character with the highest score is our prediction.
+        # Shape: [Batch_Size, Vocab_Size] -> [1, 58] (if vocab has 58 chars)
+        # =====================================================================
+
         return logits, h_new.squeeze(0), attn
+
+class Seq2Seq(nn.Module):
+    """ Main model that combines the Encoder and Decoder."""
+    def __init__(self, enc: Encoder, dec: Decoder, src_pad_id: int):
+        super().__init__()
+        self.enc = enc
+        self.dec = dec
+        self.src_pad_id = src_pad_id
+
+    def make_src_mask(self,  src):
+        """Creates a mask to identify padding tokens in the soruce. """
+        # =====================================================================
+        # Step 2: Creating the Attention Mask
+        # =====================================================================
+        # Input `src`: A tensor of source token IDs.
+        # Shape: [Batch_Size, Src_Len]
+        #
+        # Logic: This performs a simple element-wise comparison. For every
+        # token ID in the `src` tensor, it checks: "Is this ID NOT the padding ID?".
+        # The result is a boolean tensor (True/False).
+        # .long() converts True to 1 and False to 0.
+        #
+        # Output: A tensor where 1s represent real tokens and 0s represent
+        # padding tokens. This mask is fed to the DotAttention module to tell
+        # it "you are not allowed to pay attention to the 0s".
+        # Shape: [Batch_Size, Src_Len]
+        return (src != self.src_pad_id).long()
+
+    def forward(self, src, src_lens, tgt_in, teacher_forcing=True):
+        # =====================================================================
+        # Step 1: Encoding the Source
+        # =====================================================================
+        # This line runs the entire batch of source sentences through the Encoder.
+        enc_out, enc_h = self.enc(src, src_lens)
+        #
+        # DATA AT THIS STEP:
+        # `enc_out`: The output hidden state from *every* timestep of the encoder.
+        #            This is the "source document" the decoder will look at.
+        #            Shape: [B, Src_Len, H] -> [2, 5, 256]
+        # `enc_h`: The *final* hidden state from the encoder. This is the "thought
+        #          vector" or context that summarizes the entire source sentence.
+        #          Shape: [B, H] -> [2, 256]
+        # =====================================================================
+        enc_out, enc_h = self.enc(src, src_lens)
+        src_mask = self.make_src_mask(src)
+
+        B, T = tgt_in.shape
+        logits_list = []
+        dec_h = enc_h
+        x_t = tgt_in[:, 0]
+
+        for t in range(T):
+            step_logits, dec_h, _ = self.dec.forward_step(x_t, dec_h, enc_out, src_mask)
+            logits_list.append(step_logits.unsqueeze(1))
+
+            # What is teacher forcing
+            # During training, we can either feed the decoders own previous prediction
+            # as the next input, or we can ffed the actual correct toekn from the
+            # target sequence. The latter is called teacher forcing. It stabilizes
+            # training and helps the model learn faster
+            if teacher_forcing:
+                x_t = tgt_in[:, t+1] if t < T - 1 else x_t
+            else:
+                x_t = step_logits.argmax(-1)
+
+        return torch.cat(logits_list, dim=1)
+
+    def greedy_decode(self, src, src_lens, max_len, sos_id, eos_id):
+        """ Geneartes a translation during inference using a greedy approach"""
+        self.eval()
+        with torch.no_grad():
+            enc_out, enc_h = self.enc(src, src_lens)
+            src_mask = self.make_src_mask(src)
+
+            B = src.size(0)
+            generated   = [[] for _ in range(B)]
+            attn_all    = [[] for _ in range(B)]
+            x_t = torch.full((B,), sos_id, dtype=torch.long, device=src.device)
+            dec_h = enc_h
+
+            for _ in range(max_len):
+                step_logits, dec_h, attn = self.dec.forward_step(x_t, dec_h, enc_out, src_mask)
+                x_t = step_logits.argmax(dim=1)
+                for i in range(B):
+                    if x_t[i].item() == eos_id: continue
+                    generated[i].append(x_t[i].item())
+                    attn_all[i].append(attn[i].detach().cpu())
+            return generated, attn_all
 
 def main():
     ds = load_dataset("bentrevett/multi30k")
