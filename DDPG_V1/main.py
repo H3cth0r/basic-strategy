@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import gymnasium as gym
+import time # Import time for adding a small delay during rendering
 
 # --- Device Configuration ---
 if torch.backends.mps.is_available():
@@ -64,7 +65,6 @@ class ReplayBuffer(object):
 
         for i in ind:
             X, Y, U, R, D = self.storage[i]
-            # --- FIX: Changed np.array(..., copy=False) to np.asarray(...) ---
             x.append(np.asarray(X))
             y.append(np.asarray(Y))
             u.append(np.asarray(U))
@@ -154,14 +154,53 @@ class DDPG(object):
             target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
 
+# ===================================================================================
+# +++ NEW: Evaluation Function +++
+# ===================================================================================
+def evaluate_policy(agent, env_name, eval_episodes=1):
+    """Runs policy for X episodes and returns average reward, rendering the environment."""
+    # Important: Create a new environment for evaluation, with rendering enabled
+    eval_env = gym.make(env_name, render_mode="human")
+    
+    total_reward = 0.
+    for i in range(eval_episodes):
+        state, _ = eval_env.reset()
+        done = False
+        episode_reward = 0
+        while not done:
+            # Select action deterministically (no noise)
+            action = agent.select_action(state)
+            
+            next_state, reward, terminated, truncated, _ = eval_env.step(action)
+            done = terminated or truncated
+            
+            episode_reward += reward
+            state = next_state
+            
+            # Optional: add a small delay to make rendering smoother
+            time.sleep(0.005)
+        
+        total_reward += episode_reward
+        print(f"Evaluation Episode {i+1}: Reward = {episode_reward:.2f}")
+
+    eval_env.close()
+    avg_reward = total_reward / eval_episodes
+    return avg_reward
+# ===================================================================================
+
+
 if __name__ == "__main__":
     env_name = "Pendulum-v1"
+    # The training environment does not need rendering
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
     
     agent = DDPG(state_dim, action_dim, max_action, device)
+    
+    # --- CHANGE: Added a frequency for evaluation ---
+    EVAL_FREQ = 50  # Evaluate and render every 50 episodes
     
     for i in range(2000):
         state, _ = env.reset()
@@ -185,3 +224,13 @@ if __name__ == "__main__":
             if done:
                 break
         print(f"Episode: {i+1}, Total Reward: {episode_reward:.2f}")
+
+        # --- CHANGE: Perform evaluation and rendering periodically ---
+        if (i + 1) % EVAL_FREQ == 0:
+            print("\n---------------------------------------")
+            print(f"Running evaluation for Episode {i+1}...")
+            avg_reward = evaluate_policy(agent, env_name)
+            print(f"Evaluation Avg. Reward: {avg_reward:.2f}")
+            print("---------------------------------------\n")
+            
+    env.close()
