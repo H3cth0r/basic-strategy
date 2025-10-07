@@ -38,7 +38,7 @@ np.random.seed(GLOBAL_SEED)
 torch.manual_seed(GLOBAL_SEED)
 
 # =============================================================================
-# Custom Trading Environment with profit-friendly risk and churn controls
+# Environment with PV-delta reward
 # =============================================================================
 
 class TradingEnv(gym.Env):
@@ -52,28 +52,40 @@ class TradingEnv(gym.Env):
         is_training=True,
         episode_duration_minutes=4320,
         transaction_fee=0.001,
-        action_threshold=0.15,          # larger hysteresis: act only if allocation error > 15%
-        action_interpretation="target", # 'delta' or 'target'
-        max_trade_frac_per_step=0.10,   # rebalance cap per step to 10% PV
-        cooldown_steps=15,              # force fewer trades
+        action_threshold=0.20,
+        action_interpretation="target",
+        max_trade_frac_per_step=0.07,
+        cooldown_steps=20,
         allow_short=False,
-        min_usd_trade=100.0,            # minimum trade size (USD)
+        min_usd_trade=100.0,
         # Risk cap from realized volatility
         use_risk_cap=True,
-        risk_cap_base=0.10,             # numerator for risk cap = risk_cap_base / daily_vol
+        risk_cap_base=0.10,
         risk_cap_min=0.05,
         risk_cap_max=0.60,
-        # Action smoothing to damp oscillations
+        # Trend conditioning (kept; helps sizing)
+        trend_k=1.5,
+        trend_min_scale=0.4,
+        # Action smoothing
         action_smoothing_alpha=0.30,
-        # Reward shaping
-        gain_scale=1.0,                 # positive log-return scale
-        loss_scale=2.0,                 # stronger penalty on negative returns
-        turnover_penalty_coeff=0.10,    # penalize turnover meaningfully
-        trade_exec_penalty=0.0005,      # per-trade nuisance penalty
-        trade_pnl_coeff=0.0,            # REMOVE realized-PnL bonus (it encourages churning)
-        terminal_profit_scale=2.0,      # terminal bonus proportional to final PnL
-        early_stop_drawdown=0.20,       # stop if DD > 20%
-        early_stop_penalty=3.0          # penalty for hitting early-stop
+        # NEW: PV-delta reward scale
+        pv_reward_scale=200.0,        # key scaling: +0.5% => +1.0 reward
+        # Curve-shaping (lighter so they don't dominate returns)
+        turnover_penalty_coeff=0.03,  # reduced
+        trade_exec_penalty=0.0002,    # reduced
+        alloc_change_penalty_coeff=0.02,  # reduced
+        dd_tolerance=0.02,
+        dd_penalty_coeff=0.30,        # moderate
+        hwm_bonus_coeff=0.20,         # small
+        end_hold_penalty_coeff=0.03,  # small
+        # Terminal/early-stop
+        terminal_profit_scale=0.0,    # not needed since PV-delta sums to total perf; keep 0
+        early_stop_drawdown=0.20,
+        early_stop_penalty=1.0,       # smaller since PV reward now carries the episode
+        # End-of-episode flattening
+        flat_end_steps=90,
+        force_flat_end=True,
+        force_liquidate_on_terminal=True
     ):
         super(TradingEnv, self).__init__()
         self.full_df = df.dropna().reset_index(drop=True)
@@ -91,34 +103,43 @@ class TradingEnv(gym.Env):
         self.allow_short = bool(allow_short)
         self.min_usd_trade = float(min_usd_trade)
 
-        # Risk cap
+        # Risk/trend
         self.use_risk_cap = bool(use_risk_cap)
         self.risk_cap_base = float(risk_cap_base)
         self.risk_cap_min = float(risk_cap_min)
         self.risk_cap_max = float(risk_cap_max)
+        self.trend_k = float(trend_k)
+        self.trend_min_scale = float(trend_min_scale)
 
-        # Action smoothing
+        # Smoothing
         self.action_smoothing_alpha = float(action_smoothing_alpha)
 
-        # Reward shaping params
-        self.gain_scale = float(gain_scale)
-        self.loss_scale = float(loss_scale)
+        # Reward params
+        self.pv_reward_scale = float(pv_reward_scale)
         self.turnover_penalty_coeff = float(turnover_penalty_coeff)
         self.trade_exec_penalty = float(trade_exec_penalty)
-        self.trade_pnl_coeff = float(trade_pnl_coeff)
+        self.alloc_change_penalty_coeff = float(alloc_change_penalty_coeff)
+        self.dd_tolerance = float(dd_tolerance)
+        self.dd_penalty_coeff = float(dd_penalty_coeff)
+        self.hwm_bonus_coeff = float(hwm_bonus_coeff)
+        self.end_hold_penalty_coeff = float(end_hold_penalty_coeff)
         self.terminal_profit_scale = float(terminal_profit_scale)
         self.early_stop_drawdown = float(early_stop_drawdown)
         self.early_stop_penalty = float(early_stop_penalty)
 
+        # End behavior
+        self.flat_end_steps = int(flat_end_steps)
+        self.force_flat_end = bool(force_flat_end)
+        self.force_liquidate_on_terminal = bool(force_liquidate_on_terminal)
+
         # Action space
         self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
 
-        # Observation: all features except 'Original_Close' + 3 portfolio features
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(len(self.full_df.columns) - 1 + 3,),
-            dtype=np.float32
-        )
+        # Observation: market features (exclude 'Original_Close') + 9 portfolio/time features
+        self.extra_features_dim = 9
+        market_dim = len([c for c in self.full_df.columns if c != 'Original_Close'])
+        obs_dim = market_dim + self.extra_features_dim
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
         self.reset_trackers()
 
@@ -143,18 +164,27 @@ class TradingEnv(gym.Env):
         self.time_in_market_steps = 0
         self.time_above_initial_steps = 0
 
-        # Trade win/loss via realized PnL
         self.cost_basis = 0.0
         self.realized_pnl = 0.0
         self.winning_trades = 0
         self.losing_trades = 0
 
-        # Per-step win/loss
         self.winning_steps = 0
         self.losing_steps = 0
 
-        # Action smoothing memory
         self.prev_action = 0.0
+        self.prev_pos_frac = 0.0
+
+    def _episode_length_steps(self):
+        return len(self.df) - 1
+
+    def _step_progress(self):
+        total = max(1, self._episode_length_steps() - self.lookback_window)
+        idx = max(0, self.current_step - self.lookback_window)
+        return np.clip(idx / total, 0.0, 1.0)
+
+    def _remaining_steps(self):
+        return max(0, (len(self.df) - 1) - self.current_step)
 
     def _get_observation(self):
         obs_df = self.df.drop(columns=['Original_Close'])
@@ -164,10 +194,24 @@ class TradingEnv(gym.Env):
         crypto_value = self.crypto_held * current_price
         pv_safe = max(1e-8, self.balance + crypto_value)
 
+        step_prog = float(self._step_progress())
+        time_to_close = float(1.0 - step_prog)
+        prev_peak = max(1e-8, self.peak_pv)
+        curr_dd = float(max(0.0, (prev_peak - pv_safe) / prev_peak))
+        risk_cap_now = float(self._compute_risk_cap())
+        hwm_ratio = float(min(1.0, pv_safe / prev_peak))
+        realized_pnl_norm = float(self.realized_pnl / self.initial_balance)
+
         portfolio_state = np.array([
-            self.balance / pv_safe,         # cash fraction
-            crypto_value / pv_safe,         # position fraction
-            pv_safe / self.initial_balance  # normalized PV
+            self.balance / pv_safe,          # cash fraction
+            crypto_value / pv_safe,          # position fraction
+            pv_safe / self.initial_balance,  # normalized PV
+            step_prog,                       # episode progress
+            time_to_close,                   # time-to-close
+            curr_dd,                         # current drawdown
+            risk_cap_now,                    # risk cap (trend-conditioned)
+            hwm_ratio,                       # PV vs peak (<=1)
+            realized_pnl_norm                # realized PnL normalized
         ], dtype=np.float32)
 
         return np.concatenate((market_obs, portfolio_state))
@@ -209,73 +253,60 @@ class TradingEnv(gym.Env):
             return True
         return (self.current_step - self.last_trade_step) >= self.cooldown_steps
 
+    def _compute_trend_strength(self):
+        val = float(self.df.loc[self.current_step, 'ret_60m']) if 'ret_60m' in self.df.columns else 0.0
+        return 1.0 / (1.0 + math.exp(-self.trend_k * val))
+
     def _compute_risk_cap(self):
         if not self.use_risk_cap:
-            return 1.0
-        vol_raw = float(self.df.loc[self.current_step, 'vol_60m_raw']) if 'vol_60m_raw' in self.df.columns else None
-        if vol_raw is None or vol_raw <= 0:
-            return self.risk_cap_max
-        daily_vol = vol_raw * math.sqrt(1440.0)
-        cap = self.risk_cap_base / max(1e-8, daily_vol)
-        return float(np.clip(cap, self.risk_cap_min, self.risk_cap_max))
+            base_cap = 1.0
+        else:
+            vol_raw = float(self.df.loc[self.current_step, 'vol_60m_raw']) if 'vol_60m_raw' in self.df.columns else None
+            if vol_raw is None or vol_raw <= 0:
+                base_cap = self.risk_cap_max
+            else:
+                daily_vol = vol_raw * math.sqrt(1440.0)
+                base_cap = self.risk_cap_base / max(1e-8, daily_vol)
+                base_cap = float(np.clip(base_cap, self.risk_cap_min, self.risk_cap_max))
+        trend_strength = self._compute_trend_strength()
+        trend_scale = self.trend_min_scale + (1.0 - self.trend_min_scale) * trend_strength
+        return float(np.clip(base_cap * trend_scale, 0.0, 1.0))
 
     def step(self, action):
-        # Smooth action to reduce jitter
         raw_action = float(action[0] if isinstance(action, (np.ndarray, list, tuple)) else action)
         action_val = self.prev_action * (1.0 - self.action_smoothing_alpha) + raw_action * self.action_smoothing_alpha
         self.prev_action = action_val
 
         current_price = float(self.df.loc[self.current_step, 'Original_Close'])
         prev_pv = max(1e-8, self.portfolio_value)
+        prev_balance = self.balance
+        prev_pos_frac_local = self.prev_pos_frac
+        prev_peak_before_update = self.peak_pv
+
         trade_executed = False
         traded_value_abs = 0.0
         realized_pnl_step = 0.0
 
-        # Interpret action
-        if self.action_interpretation == "delta":
-            # Discouraged; kept for compatibility if user flips mode
-            if action_val > self.action_threshold and self._trade_allowed():
-                trade_amount_usd = self.balance * action_val
-                if trade_amount_usd >= self.min_usd_trade:
-                    fee = trade_amount_usd * self.transaction_fee
-                    buy_qty = trade_amount_usd / current_price
-                    if (trade_amount_usd + fee) <= self.balance + 1e-8:
-                        self.balance -= (trade_amount_usd + fee)
-                        self.crypto_held += buy_qty
-                        self._update_cost_basis_on_buy(buy_qty, current_price, fee)
-                        self.buy_trades += 1
-                        self.num_trades += 1
-                        traded_value_abs = trade_amount_usd
-                        self.last_trade_step = self.current_step
-                        trade_executed = True
-            elif action_val < -self.action_threshold and self._trade_allowed():
-                trade_amount_crypto = self.crypto_held * min(1.0, abs(action_val))
-                trade_amount_usd = trade_amount_crypto * current_price
-                if trade_amount_crypto > 1e-6 and trade_amount_usd >= self.min_usd_trade:
-                    fee = trade_amount_usd * self.transaction_fee
-                    self.balance += (trade_amount_usd - fee)
-                    self.crypto_held -= trade_amount_crypto
-                    realized_pnl_step = self._realize_pnl_on_sell(trade_amount_crypto, current_price, fee)
-                    self.sell_trades += 1
-                    self.num_trades += 1
-                    traded_value_abs = trade_amount_usd
-                    self.last_trade_step = self.current_step
-                    trade_executed = True
+        # Current allocation
+        crypto_value_now = self.crypto_held * current_price
+        pv_now = max(1e-8, self.balance + crypto_value_now)
+        current_pos_frac = crypto_value_now / pv_now
 
-        elif self.action_interpretation == "target":
-            # action is desired allocation; trade if allocation error > threshold, respecting risk cap
+        # Target allocation
+        if self.action_interpretation == "target":
             target_alloc = float(np.clip(action_val, -1.0, 1.0))
             if not self.allow_short:
                 target_alloc = max(0.0, target_alloc)
-            # Dynamic risk cap based on realized volatility
+
             max_alloc = self._compute_risk_cap()
+            if self.force_flat_end and self.flat_end_steps > 0:
+                rem = self._remaining_steps()
+                if rem <= self.flat_end_steps:
+                    max_alloc *= max(0.0, min(1.0, float(rem / self.flat_end_steps)))
+
             target_alloc = float(np.clip(target_alloc, -max_alloc if self.allow_short else 0.0, max_alloc))
 
-            crypto_value_now = self.crypto_held * current_price
-            pv_now = max(1e-8, self.balance + crypto_value_now)
-            current_alloc = crypto_value_now / pv_now
-            alloc_error = target_alloc - current_alloc
-
+            alloc_error = target_alloc - current_pos_frac
             if abs(alloc_error) > self.action_threshold and self._trade_allowed():
                 desired_crypto_value = target_alloc * pv_now
                 delta_value = desired_crypto_value - crypto_value_now
@@ -294,7 +325,7 @@ class TradingEnv(gym.Env):
                                 self._update_cost_basis_on_buy(buy_qty, current_price, fee)
                                 self.buy_trades += 1
                                 self.num_trades += 1
-                                traded_value_abs = trade_amount_usd
+                                traded_value_abs += trade_amount_usd
                                 self.last_trade_step = self.current_step
                                 trade_executed = True
                     else:
@@ -307,9 +338,39 @@ class TradingEnv(gym.Env):
                             realized_pnl_step = self._realize_pnl_on_sell(sell_qty, current_price, fee)
                             self.sell_trades += 1
                             self.num_trades += 1
-                            traded_value_abs = trade_amount_usd
+                            traded_value_abs += trade_amount_usd
                             self.last_trade_step = self.current_step
                             trade_executed = True
+
+        elif self.action_interpretation == "delta":
+            # Optional delta mode
+            if action_val > self.action_threshold and self._trade_allowed():
+                trade_amount_usd = self.balance * action_val
+                if trade_amount_usd >= self.min_usd_trade:
+                    fee = trade_amount_usd * self.transaction_fee
+                    buy_qty = trade_amount_usd / current_price
+                    if (trade_amount_usd + fee) <= self.balance + 1e-8:
+                        self.balance -= (trade_amount_usd + fee)
+                        self.crypto_held += buy_qty
+                        self._update_cost_basis_on_buy(buy_qty, current_price, fee)
+                        self.buy_trades += 1
+                        self.num_trades += 1
+                        traded_value_abs += trade_amount_usd
+                        self.last_trade_step = self.current_step
+                        trade_executed = True
+            elif action_val < -self.action_threshold and self._trade_allowed():
+                trade_amount_crypto = self.crypto_held * min(1.0, abs(action_val))
+                trade_amount_usd = trade_amount_crypto * current_price
+                if trade_amount_crypto > 1e-6 and trade_amount_usd >= self.min_usd_trade:
+                    fee = trade_amount_usd * self.transaction_fee
+                    self.balance += (trade_amount_usd - fee)
+                    self.crypto_held -= trade_amount_crypto
+                    realized_pnl_step = self._realize_pnl_on_sell(trade_amount_crypto, current_price, fee)
+                    self.sell_trades += 1
+                    self.num_trades += 1
+                    traded_value_abs += trade_amount_usd
+                    self.last_trade_step = self.current_step
+                    trade_executed = True
 
         # Advance time
         self.current_step += 1
@@ -318,14 +379,17 @@ class TradingEnv(gym.Env):
         next_price = float(self.df.loc[self.current_step, 'Original_Close'])
         self.portfolio_value = float(self.balance + (self.crypto_held * next_price))
 
-        # Metrics updates
+        # Metrics updates and drawdown/HWM
         self.max_pv = max(self.max_pv, self.portfolio_value)
         self.min_pv = min(self.min_pv, self.portfolio_value)
+
+        prev_peak = max(self.peak_pv, 1e-8)
+        drawdown = 0.0 if prev_peak <= 0 else (prev_peak - self.portfolio_value) / prev_peak
+        self.max_drawdown = max(self.max_drawdown, drawdown)
         if self.portfolio_value > self.peak_pv:
             self.peak_pv = self.portfolio_value
-        drawdown = 0.0 if self.peak_pv <= 0 else (self.peak_pv - self.portfolio_value) / self.peak_pv
-        self.max_drawdown = max(self.max_drawdown, drawdown)
 
+        # Step bookkeeping
         step_return = math.log(max(1e-8, self.portfolio_value) / max(1e-8, prev_pv))
         self.step_returns.append(step_return)
         if step_return > 0:
@@ -339,28 +403,52 @@ class TradingEnv(gym.Env):
         if self.portfolio_value > 0 and traded_value_abs > 0:
             self.turnover += traded_value_abs / self.portfolio_value
 
-        if (self.crypto_held * next_price) / max(1e-8, self.portfolio_value) > 0.01:
+        pos_frac_next = (self.crypto_held * next_price) / max(1e-8, self.portfolio_value)
+        if pos_frac_next > 0.01:
             self.time_in_market_steps += 1
 
-        # Reward shaping: emphasize net returns, discourage churn
-        reward = self.gain_scale * step_return if step_return >= 0 else -self.loss_scale * abs(step_return)
+        # =========================
+        # NEW: PV-delta reward
+        # =========================
+        pv_delta_frac = (self.portfolio_value - prev_pv) / self.initial_balance
+        reward = self.pv_reward_scale * pv_delta_frac
 
+        # HWM bonus (small)
+        if self.portfolio_value > prev_peak_before_update:
+            hwm_gain = (self.portfolio_value - prev_peak_before_update) / self.initial_balance
+            reward += self.hwm_bonus_coeff * hwm_gain
+
+        # Drawdown penalty beyond tolerance (moderate)
+        dd_excess = max(0.0, drawdown - self.dd_tolerance)
+        reward -= self.dd_penalty_coeff * dd_excess
+
+        # End-of-episode exposure penalty (small)
+        if self.flat_end_steps > 0:
+            rem = self._remaining_steps()
+            if rem <= self.flat_end_steps:
+                end_pressure = 1.0 - float(rem / self.flat_end_steps)
+                reward -= self.end_hold_penalty_coeff * end_pressure * pos_frac_next
+
+        # Allocation change penalty (small)
+        reward -= self.alloc_change_penalty_coeff * abs(pos_frac_next - prev_pos_frac_local)
+
+        # Trading penalties (small)
         if trade_executed:
             reward -= self.trade_exec_penalty
-            if self.trade_pnl_coeff != 0.0 and realized_pnl_step != 0.0:
-                reward += self.trade_pnl_coeff * (realized_pnl_step / prev_pv)
-
         if traded_value_abs > 0:
             reward -= self.turnover_penalty_coeff * (traded_value_abs / prev_pv)
 
-        # Early stop on large drawdown
+        # Early stop on massive drawdown
         if drawdown >= self.early_stop_drawdown and not terminated:
             terminated = True
             reward -= self.early_stop_penalty
 
-        # Terminal profit bonus
-        if terminated:
+        # Terminal profit bonus (set to 0 by default; PV-delta already accounts for total perf)
+        if terminated and self.terminal_profit_scale != 0.0:
             reward += self.terminal_profit_scale * ((self.portfolio_value / self.initial_balance) - 1.0)
+
+        # Update prev position fraction tracker
+        self.prev_pos_frac = pos_frac_next
 
         obs = self._get_observation()
         return obs, reward, terminated, False, {}
@@ -371,8 +459,7 @@ class TradingEnv(gym.Env):
             mean_r = statistics.fmean(self.step_returns)
             std_r = statistics.pstdev(self.step_returns)
             if std_r > 0:
-                sharpe = (mean_r / std_r) * math.sqrt(1440.0)  # minute->day scaling
-
+                sharpe = (mean_r / std_r) * math.sqrt(1440.0)
         trade_win_rate = 0.0
         decided = self.winning_trades + self.losing_trades
         if decided > 0:
@@ -404,6 +491,22 @@ class TradingEnv(gym.Env):
 # Data loading and feature engineering (train-only normalization)
 # =============================================================================
 
+def _add_time_features(df):
+    df['minute'] = df['Datetime'].dt.minute.astype(int)
+    df['hour'] = df['Datetime'].dt.hour.astype(int)
+    df['dayofweek'] = df['Datetime'].dt.dayofweek.astype(int)
+
+    df['minute_of_day'] = df['hour'] * 60 + df['minute']
+    mod = 2 * np.pi * (df['minute_of_day'] / 1440.0)
+    df['mod_sin'] = np.sin(mod)
+    df['mod_cos'] = np.cos(mod)
+
+    dow = 2 * np.pi * (df['dayofweek'] / 7.0)
+    df['dow_sin'] = np.sin(dow)
+    df['dow_cos'] = np.cos(dow)
+
+    df.drop(columns=['minute', 'hour', 'dayofweek', 'minute_of_day'], inplace=True)
+
 def load_raw_data(url):
     print("Loading and preparing data...")
     df = pd.read_csv(url, skiprows=3, header=None)
@@ -411,15 +514,12 @@ def load_raw_data(url):
     df['Datetime'] = pd.to_datetime(df['Datetime'])
     df = df.sort_values('Datetime').reset_index(drop=True)
 
-    # Coerce numerics
     for col in ['Close', 'High', 'Low', 'Open', 'Volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df.dropna(inplace=True)
 
-    # Preserve original close for pricing
     df['Original_Close'] = df['Close'].astype(float)
 
-    # Core features
     df['log_close'] = np.log(df['Original_Close'])
     df['ret_1m'] = df['log_close'].diff(1)
 
@@ -427,45 +527,48 @@ def load_raw_data(url):
         df[f'ret_{w}m'] = df['log_close'].diff(w)
         df[f'vol_{w}m_raw'] = df['ret_1m'].rolling(w).std()
 
-    # RSI and MACD on original price
     df['RSI'] = ta.momentum.RSIIndicator(close=df['Original_Close'], window=14).rsi()
     macd = ta.trend.MACD(close=df['Original_Close'])
     df['MACD'] = macd.macd_diff()
 
-    # EMA momentum
     df['ema_12'] = df['Original_Close'].ewm(span=12, adjust=False).mean()
     df['ema_48'] = df['Original_Close'].ewm(span=48, adjust=False).mean()
     df['ema_ratio'] = df['ema_12'] / (df['ema_48'] + 1e-8) - 1.0
 
-    # ATR percentage
-    # THIS IS THE CORRECTED LINE:
-    atr = ta.volatility.AverageTrueRange(high=df['High'], low=df['Low'], close=df['Original_Close'], window=14).average_true_range()
+    atr = ta.volatility.AverageTrueRange(
+        high=df['High'], low=df['Low'], close=df['Original_Close'], window=14
+    ).average_true_range()
     df['atr_raw'] = atr
     df['atr_pct_raw'] = df['atr_raw'] / (df['Original_Close'] + 1e-8)
 
-    # Volume zscore (rolling)
     vol_mean = df['Volume'].rolling(240).mean()
     vol_std = df['Volume'].rolling(240).std()
     df['vol_z_240'] = (df['Volume'] - vol_mean) / (vol_std + 1e-8)
 
-    # Drop early NA from indicators
+    _add_time_features(df)
     df.dropna(inplace=True)
+
+    df = df.reset_index(drop=True)
+    df.drop(columns=['Datetime'], inplace=True, errors='ignore')
+
     print("Data preparation complete.")
     return df.reset_index(drop=True)
 
 def fit_train_normalization(train_df, exclude_cols):
-    feature_cols = [c for c in train_df.columns if c not in exclude_cols]
+    numeric_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+    feature_cols = [c for c in numeric_cols if c not in exclude_cols]
     mean = train_df[feature_cols].mean()
     std = train_df[feature_cols].std().replace(0, 1e-8)
     return feature_cols, mean, std
 
 def apply_normalization(df, feature_cols, mean, std):
     df_norm = df.copy()
-    df_norm[feature_cols] = (df_norm[feature_cols] - mean) / std
+    cols = [c for c in feature_cols if c in df_norm.columns]
+    df_norm[cols] = (df_norm[cols] - mean[cols]) / std[cols]
     return df_norm
 
 # =============================================================================
-# Actor/Critic Networks (TD3)
+# Actor/Critic (TD3). You can keep your gating if desired; here we keep it simple.
 # =============================================================================
 
 class Actor(nn.Module):
@@ -485,11 +588,10 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
-        # Q1
         self.l1 = nn.Linear(state_dim + action_dim, 384)
         self.l2 = nn.Linear(384, 256)
         self.l3 = nn.Linear(256, 1)
-        # Q2
+
         self.l4 = nn.Linear(state_dim + action_dim, 384)
         self.l5 = nn.Linear(384, 256)
         self.l6 = nn.Linear(256, 1)
@@ -552,13 +654,13 @@ class TD3:
         grad_clip_norm=1.0
     ):
         self.device = device
-        self.actor = Actor(state_dim, action_dim, max_action).to(device)
-        self.actor_target = Actor(state_dim, action_dim, max_action).to(device)
+        self.actor = Actor(state_dim, action_dim, max_action).to(self.device)
+        self.actor_target = Actor(state_dim, action_dim, max_action).to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
 
-        self.critic = Critic(state_dim, action_dim).to(device)
-        self.critic_target = Critic(state_dim, action_dim).to(device)
+        self.critic = Critic(state_dim, action_dim).to(self.device)
+        self.critic_target = Critic(state_dim, action_dim).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
@@ -620,10 +722,7 @@ class TD3:
             for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-        return {
-            'critic_loss': float(critic_loss.detach().cpu().item()),
-            'actor_loss': actor_loss_val
-        }
+        return {'critic_loss': float(critic_loss.detach().cpu().item()), 'actor_loss': actor_loss_val}
 
 # =============================================================================
 # Plotting and Evaluation
@@ -656,9 +755,8 @@ def evaluate_agent(agent, env, initial_balance):
     }
     prev_balance, prev_crypto_held = env.balance, env.crypto_held
 
-    # Action smoothing in eval as well (matches env internal smoothing)
     while not done:
-        action = agent.select_action(state)  # deterministic eval
+        action = agent.select_action(state)
         next_state, _, terminated, _, _ = env.step(action)
         done = terminated
 
@@ -690,7 +788,6 @@ def evaluate_agent(agent, env, initial_balance):
 # =============================================================================
 
 if __name__ == "__main__":
-    # --- Config ---
     data_url = "https://raw.githubusercontent.com/H3cth0r/stonks-data/refs/heads/main/data/CRYPTO/BTC-USD/data_0.csv"
     total_training_episodes = 200
     batch_size = 256
@@ -699,32 +796,25 @@ if __name__ == "__main__":
     EPISODE_DURATION_DAYS = 3
     episode_duration_minutes = EPISODE_DURATION_DAYS * 24 * 60
 
-    # Exploration schedule: smaller noise to avoid harmful churn
     EXPLORATION_STEPS = 5_000
     TRAIN_NOISE_STD = 0.02
     MAX_GRAD_NORM = 1.0
 
-    # Checkpointing
     os.makedirs("checkpoints", exist_ok=True)
     best_val_perf = -1e9
     best_train_pv = -1e9
 
-    # --- Data ---
     data_df_raw = load_raw_data(data_url)
 
-    # Split before normalization to avoid leakage
     split_idx = int(len(data_df_raw) * 0.8)
     train_df_raw = data_df_raw.iloc[:split_idx].reset_index(drop=True)
     val_df_raw = data_df_raw.iloc[split_idx:].reset_index(drop=True)
 
-    # Columns to exclude from normalization (keep as raw for risk cap and pricing)
     exclude_cols = [
         'Original_Close',
-        'log_close',          # keep raw log close drift
         'atr_raw', 'atr_pct_raw',
         'vol_5m_raw', 'vol_15m_raw', 'vol_60m_raw', 'vol_240m_raw'
     ]
-    # Create missing exclude keys if not present
     exclude_cols = [c for c in exclude_cols if c in train_df_raw.columns]
 
     feature_cols, mean, std = fit_train_normalization(train_df_raw, exclude_cols=exclude_cols)
@@ -733,36 +823,42 @@ if __name__ == "__main__":
 
     print(f"Training data: {len(train_df)} points\nValidation data: {len(val_df)} points")
 
-    # --- Environments (aligned settings) ---
     env_kwargs = dict(
         initial_balance=initial_balance,
         episode_duration_minutes=episode_duration_minutes,
         transaction_fee=0.001,
-        action_threshold=0.15,
+        action_threshold=0.20,
         action_interpretation="target",
-        max_trade_frac_per_step=0.10,
-        cooldown_steps=15,
+        max_trade_frac_per_step=0.07,
+        cooldown_steps=20,
         allow_short=False,
         min_usd_trade=100.0,
         use_risk_cap=True,
         risk_cap_base=0.10,
         risk_cap_min=0.05,
         risk_cap_max=0.60,
+        trend_k=1.5,
+        trend_min_scale=0.4,
         action_smoothing_alpha=0.30,
-        gain_scale=1.0,
-        loss_scale=2.0,
-        turnover_penalty_coeff=0.10,
-        trade_exec_penalty=0.0005,
-        trade_pnl_coeff=0.0,           # no realized PnL reward
-        terminal_profit_scale=2.0,
+        pv_reward_scale=200.0,          # key: scale PV-delta reward
+        turnover_penalty_coeff=0.03,
+        trade_exec_penalty=0.0002,
+        alloc_change_penalty_coeff=0.02,
+        dd_tolerance=0.02,
+        dd_penalty_coeff=0.30,
+        hwm_bonus_coeff=0.20,
+        end_hold_penalty_coeff=0.03,
+        terminal_profit_scale=0.0,
         early_stop_drawdown=0.20,
-        early_stop_penalty=3.0
+        early_stop_penalty=1.0,
+        flat_end_steps=90,
+        force_flat_end=True,
+        force_liquidate_on_terminal=True
     )
 
     train_env = TradingEnv(df=train_df, is_training=True, **env_kwargs)
     val_env = TradingEnv(df=val_df, is_training=False, **env_kwargs)
 
-    # --- Agent (TD3) ---
     state_dim = train_env.observation_space.shape[0]
     action_dim = train_env.action_space.shape[0]
     max_action = float(train_env.action_space.high[0])
@@ -782,7 +878,6 @@ if __name__ == "__main__":
         grad_clip_norm=MAX_GRAD_NORM
     )
 
-    # --- Run-level trackers ---
     run_high = -1e18
     run_low = 1e18
     global_steps = 0
@@ -840,7 +935,6 @@ if __name__ == "__main__":
         )
         print(f"Run High so far: ${run_high:,.2f} | Run Low so far: ${run_low:,.2f}")
 
-        # Save best training PV
         if train_env.portfolio_value > best_train_pv:
             best_train_pv = train_env.portfolio_value
             torch.save({
@@ -850,7 +944,6 @@ if __name__ == "__main__":
                 'critic_target': agent.critic_target.state_dict(),
             }, "checkpoints/best_train.pt")
 
-        # Validation
         if (ep + 1) % validation_freq == 0:
             val_portfolio, val_perf, history, trades, val_metrics = evaluate_agent(agent, val_env, initial_balance)
             print("------------------------------------------------------")
