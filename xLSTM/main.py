@@ -1,17 +1,22 @@
 # ------------------------------------------------------------
 # xLSTM + Recurrent PPO for BTC-USD intraday trading (1-min)
-# Single-file implementation with data loading, indicators (ta),
-# custom xLSTM, environment, PPO training (epoch-based), and backtesting.
-# Uses tqdm for progress and matplotlib for plots.
-# Device: MPS/CUDA/CPU auto-detected.
-# Numerically-stabilized to avoid NaNs on MPS/CUDA.
-# Improved environment and training to reduce churn and seek profitability:
-#  - Actions map to target position (0.0, 0.5, 1.0) instead of fixed buy/sell.
-#  - Rebalance only when change exceeds threshold to avoid overtrading.
-#  - Log-return reward with turnover penalty.
-#  - Turbulence forces flat position.
-#  - Longer epochs covering full training data.
-#  - More detailed logging per epoch and tqdm in evaluation.
+# Single-file implementation with:
+#  - Data loading (from provided URL) + ta indicators + z-score
+#  - Custom xLSTM actor/critic (stabilized)
+#  - Trading environment with target-position actions & turbulence gating
+#  - Recurrent PPO training with GAE, tqdm progress, and plots
+#  - Comprehensive backtesting metrics and prints (Train/Val/Test)
+#
+# Notes on improvements to seek profitability over your current run:
+#  - Actions represent target position ratios (keep/0.5/1.0) to reduce churn
+#  - Rebalance only if change exceeds a threshold (avoids micro-rebalancing)
+#  - Log-return reward with turnover penalty and turbulence gating
+#  - Advantage normalization, cosine LR schedules, temperature annealing
+#  - Numerically stabilized xLSTM cell (clamps and norm) for MPS
+#  - Backtesting prints include CR, MER, MPB, APPT, SR, WinRate, Turnover,
+#    MaxDD, Calmar, AvgTradeRet, AvgHoldMins, and rolling SR/DDrawdown plots
+#
+# Keep everything in one file. Run: python main.py
 # ------------------------------------------------------------
 
 import os
@@ -113,7 +118,7 @@ def get_data():
         if col != 'Original_Close':  # will be added after
             mu = df[col].mean()
             sigma = df[col].std()
-            sigma = sigma if sigma and not np.isnan(sigma) else 1e-7
+            sigma = sigma if (sigma is not None and not np.isnan(sigma) and sigma > 0) else 1e-7
             df[col] = (df[col] - mu) / (sigma + 1e-7)
 
     df["Original_Close"] = original_close
@@ -160,21 +165,25 @@ class BTCRLEnv:
         data: pd.DataFrame,
         time_window: int = 30,
         initial_balance: float = 1_000_000.0,
-        cost_rate: float = 0.0005,     # 0.05% per trade
-        rebalance_threshold: float = 0.10,  # rebalance only if change >10% of portfolio
-        turnover_penalty: float = 0.10,     # penalize turnover in reward
-        turbulence_window: int = 60,  # minutes
-        turbulence_threshold: float = 3.0,  # abs z-score threshold
+        cost_rate: float = 0.0005,        # 0.05% per trade
+        slippage_bps: float = 1.0,        # 1 bps slippage
+        rebalance_threshold: float = 0.15,  # rebalance only if change >15% of portfolio
+        turnover_penalty: float = 0.05,     # penalize turnover in reward
+        turbulence_window: int = 60,      # minutes
+        turbulence_threshold: float = 3.0, # abs z-score threshold
+        max_dd_stop: float = 0.25,        # stop trading when DD exceeds 25%
         feature_exclude: List[str] = None
     ):
         self.data = data.copy()
         self.time_window = time_window
         self.initial_balance = initial_balance
         self.cost_rate = cost_rate
+        self.slippage_bps = slippage_bps / 10_000.0
         self.rebalance_threshold = rebalance_threshold
         self.turnover_penalty = turnover_penalty
         self.turbulence_window = turbulence_window
         self.turbulence_threshold = turbulence_threshold
+        self.max_dd_stop = max_dd_stop
 
         if feature_exclude is None:
             feature_exclude = ["Original_Close", "Return"]
@@ -194,7 +203,6 @@ class BTCRLEnv:
         self.reset()
 
     def _obs_from_index(self, idx: int) -> np.ndarray:
-        # Safe observation getter using bounded idx
         idx = max(0, min(idx, len(self.data) - 1))
         row = self.data.iloc[idx]
         obs = row[self.feature_cols].values.astype(np.float32)
@@ -221,6 +229,7 @@ class BTCRLEnv:
         self.peak_value = self.initial_balance
         self.drawdowns = []
         self.actions_taken = []
+        self.trade_log = []  # detailed trade info
 
         # Skip initial time window as warmup (hold)
         self.idx = max(self.idx, self.time_window - 1)
@@ -231,34 +240,60 @@ class BTCRLEnv:
         return position_value / (self.total_value + 1e-8)
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        """
-        Action: 0 keep target, 1 -> target 0.5, 2 -> target 1.0
-        Turbulence forces target to 0.0 (flat)
-        """
         if self.done:
             return self._obs_from_index(self.idx), 0.0, True, {}
 
         row = self.data.iloc[self.idx]
+        ts = self.data.index[self.idx]
         price = float(row["Original_Close"])
         turbulence_index = float(row["TurbulenceIndex"])
         reward = 0.0
 
-        # Update target position
+        # Check catastrophic DD stop (flat & end)
+        dd_current = (self.total_value - self.peak_value) / (self.peak_value + 1e-8)
+        if dd_current < -abs(self.max_dd_stop):
+            # Force flatten and end episode
+            if self.shares > 0:
+                sell_cash = self.shares * price
+                fee = sell_cash * (self.cost_rate + self.slippage_bps)
+                self.balance += (sell_cash - fee)
+                self.trade_log.append({
+                    "time": ts, "type": "STOP_SELL", "price": price,
+                    "shares": float(self.shares), "cash_change": float(sell_cash - fee),
+                    "target_pos": 0.0
+                })
+                self.shares = 0.0
+                self.n_trades += 1
+            self.prev_total_value = self.total_value
+            self.total_value = self.balance
+            log_ret = math.log(max(self.total_value / (self.prev_total_value + 1e-12), 1e-12))
+            reward = log_ret - 0.001  # small penalty for DD stop
+            self.done = True
+            obs = self._obs_from_index(self.idx)
+            info = {
+                "price": price, "balance": self.balance, "shares": self.shares,
+                "value": self.total_value, "turbulence": turbulence_index,
+                "target_pos": 0.0, "turnover": 0.0, "log_ret": log_ret,
+                "dd_stop": True
+            }
+            self.actions_taken.append(action)
+            return obs, float(reward), True, info
+
+        # Update target position (turbulence gating)
+        forced_flat = False
         if turbulence_index > self.turbulence_threshold:
             new_target = 0.0  # force flat when turbulent
-            turbulence_forced_flat = True
+            forced_flat = True
         else:
             target = self.action_targets.get(action, None)
             new_target = self.target_pos if target is None else target
-            turbulence_forced_flat = False
 
         # Compute current position ratio
         current_pos = self._current_pos_ratio(price)
         change = new_target - current_pos
-
         turnover = 0.0
+
         if abs(change) > self.rebalance_threshold:
-            # Rebalance using available cash and shares to reach target
             desired_position_value = new_target * self.total_value
             current_position_value = self.shares * price
             diff_value = desired_position_value - current_position_value
@@ -266,21 +301,34 @@ class BTCRLEnv:
             if diff_value > 0:  # buy
                 buy_cash = min(self.balance, diff_value)
                 if buy_cash > 0:
-                    shares_to_buy = buy_cash / (price + 1e-12)
-                    fee = buy_cash * self.cost_rate
-                    self.balance -= (buy_cash + fee)
+                    shares_to_buy = buy_cash / (price * (1.0 + self.slippage_bps) + 1e-12)
+                    gross_cash = shares_to_buy * price
+                    fee = gross_cash * (self.cost_rate + self.slippage_bps)
+                    net_cash = gross_cash + fee
+                    self.balance -= net_cash
                     self.shares += shares_to_buy
                     self.n_trades += 1
-                    turnover = buy_cash / (self.prev_total_value + 1e-8)
+                    turnover = net_cash / (self.prev_total_value + 1e-8)
+                    self.trade_log.append({
+                        "time": ts, "type": "BUY", "price": price,
+                        "shares": float(shares_to_buy), "cash_change": float(-net_cash),
+                        "target_pos": float(new_target)
+                    })
             elif diff_value < 0:  # sell
                 sell_shares = min(self.shares, abs(diff_value) / (price + 1e-12))
                 if sell_shares > 0:
-                    sell_cash = sell_shares * price
-                    fee = sell_cash * self.cost_rate
-                    self.balance += (sell_cash - fee)
+                    gross_cash = sell_shares * price
+                    fee = gross_cash * (self.cost_rate + self.slippage_bps)
+                    net_cash = gross_cash - fee
+                    self.balance += net_cash
                     self.shares -= sell_shares
                     self.n_trades += 1
-                    turnover = sell_cash / (self.prev_total_value + 1e-8)
+                    turnover = net_cash / (self.prev_total_value + 1e-8)
+                    self.trade_log.append({
+                        "time": ts, "type": "SELL", "price": price,
+                        "shares": float(sell_shares), "cash_change": float(net_cash),
+                        "target_pos": float(new_target)
+                    })
 
         # Update target_pos after rebalancing
         self.target_pos = new_target
@@ -289,11 +337,11 @@ class BTCRLEnv:
         self.prev_total_value = self.total_value
         self.total_value = self.balance + self.shares * price
 
-        # Reward: log-return minus turnover penalty; small penalty if turbulence forced flat
+        # Reward: log-return minus turnover penalty; penalty if trying to trade under turbulence
         log_ret = math.log(max(self.total_value / (self.prev_total_value + 1e-12), 1e-12))
         reward = log_ret - self.turnover_penalty * turnover
-        if turbulence_forced_flat and action != 0:
-            reward -= 0.0005  # small penalty for trying to trade in turbulence
+        if forced_flat and action != 0:
+            reward -= 0.001  # small penalty
 
         # Track returns and drawdown
         step_ret = (self.total_value / (self.prev_total_value + 1e-8)) - 1.0
@@ -322,6 +370,7 @@ class BTCRLEnv:
             "target_pos": self.target_pos,
             "turnover": turnover,
             "log_ret": log_ret,
+            "dd_stop": False
         }
         self.actions_taken.append(action)
         return obs, float(reward), self.done, info
@@ -510,8 +559,8 @@ class PPOAgent:
         critic_lr: float = 3e-4,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_range: float = 0.2,
-        entropy_coef: float = 0.01,
+        clip_range: float = 0.15,
+        entropy_coef: float = 0.02,
         value_coef: float = 0.5,
         max_grad_norm: float = 1.0,
         device: torch.device = torch.device("cpu"),
@@ -532,14 +581,14 @@ class PPOAgent:
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
         # Learning rate schedulers (help stronger training)
-        self.actor_sched = optim.lr_scheduler.CosineAnnealingLR(self.actor_opt, T_max=50, eta_min=1e-5)
-        self.critic_sched = optim.lr_scheduler.CosineAnnealingLR(self.critic_opt, T_max=50, eta_min=1e-5)
+        self.actor_sched = optim.lr_scheduler.CosineAnnealingLR(self.actor_opt, T_max=100, eta_min=1e-5)
+        self.critic_sched = optim.lr_scheduler.CosineAnnealingLR(self.critic_opt, T_max=100, eta_min=1e-5)
 
         # Temperature for action sampling (decays over epochs to reduce exploration)
         self.temperature = 1.0
 
     def set_temperature(self, temp: float):
-        self.temperature = max(0.5, float(temp))
+        self.temperature = max(0.6, float(temp))
 
     def act(self, obs_t: np.ndarray, actor_state: Tuple[List[torch.Tensor], List[torch.Tensor]]) -> Tuple[int, float, Tuple, torch.Tensor]:
         obs_t = np.nan_to_num(obs_t, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
@@ -580,7 +629,7 @@ class PPOAgent:
         advantages = (advantages - adv_mean) / adv_std
         return advantages, returns
 
-    def update(self, rollout: Dict[str, Any], epochs: int = 4, batch_size: int = 1024):
+    def update(self, rollout: Dict[str, Any], epochs: int = 6, batch_size: int = 512):
         obs = torch.tensor(rollout["obs"], device=self.device, dtype=TORCH_DTYPE)
         actions = torch.tensor(rollout["actions"], device=self.device, dtype=torch.long)
         old_logprobs = torch.tensor(rollout["logprobs"], device=self.device, dtype=TORCH_DTYPE)
@@ -672,11 +721,11 @@ class PPOAgent:
 def train_agent(
     env: BTCRLEnv,
     agent: PPOAgent,
-    epochs: int = 6,
+    epochs: int = 12,
     steps_per_epoch: int = None,  # default: full dataset
-    rollout_len: int = 2_048,
+    rollout_len: int = 1_024,
     update_epochs: int = 6,
-    batch_size: int = 1_024,
+    batch_size: int = 512,
 ) -> Dict[str, Any]:
     # Use full training data per epoch by default
     if steps_per_epoch is None:
@@ -689,9 +738,10 @@ def train_agent(
     all_stats = []
     total_steps_done = 0
 
+    print("Starting training (epoch-based) with full training data per epoch…")
     for ep in range(1, epochs + 1):
-        # Slightly reduce exploration temperature each epoch
-        agent.set_temperature(temp=max(0.7, 1.0 - 0.05 * (ep - 1)))
+        # Anneal exploration temperature each epoch
+        agent.set_temperature(temp=max(0.6, 1.0 - 0.04 * (ep - 1)))
 
         pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {ep}/{epochs}", leave=True)
         ep_stats = []
@@ -701,6 +751,8 @@ def train_agent(
         start_value = env.total_value
 
         steps_this_epoch = 0
+        last_print_value = env.total_value
+
         while steps_this_epoch < steps_per_epoch:
             # Rollout buffer
             rollout = {
@@ -732,10 +784,27 @@ def train_agent(
                 total_steps_done += 1
                 pbar.update(1)
 
-                # Accumulate monitoring
+                # Monitoring
                 ep_rewards.append(reward)
                 ep_actions.append(action)
                 ep_turnover += info.get("turnover", 0.0)
+
+                if steps_this_epoch % 5000 == 0:
+                    # Periodic performance snapshot
+                    eq = env.total_value
+                    peak = env.peak_value
+                    dd = (eq - peak) / (peak + 1e-8)
+                    returns = np.array(env.step_returns[-5000:], dtype=np.float64)
+                    mean_ret = float(returns.mean()) if returns.size else 0.0
+                    std_ret = float(returns.std()) + 1e-12
+                    ann_factor = math.sqrt(525600.0)
+                    sr = (mean_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
+                    pbar.set_postfix({
+                        "Equity": f"{eq:,.0f}",
+                        "DD": f"{dd:.3f}",
+                        "SR": f"{sr:.2f}",
+                        "Turnover": f"{ep_turnover:.2f}"
+                    })
 
                 if done:
                     # Reset environment and states
@@ -818,6 +887,62 @@ def train_agent(
 # ---------------------------
 # Evaluation and Backtesting
 # ---------------------------
+def compute_backtest_metrics(env: BTCRLEnv) -> Dict[str, float]:
+    equity = np.array(env.equity_curve, dtype=np.float64)
+    returns = np.array(env.step_returns, dtype=np.float64)
+    init = env.initial_balance
+    final = equity[-1]
+    cr = (final - init) / init
+    mer = np.max((equity - init) / init) if equity.size > 0 else 0.0
+    running_max = np.maximum.accumulate(equity)
+    drawdown = (equity - running_max) / (running_max + 1e-8)
+    mpb = -np.min(drawdown) if drawdown.size > 0 else 0.0
+    appt = (final - init) / (env.n_trades if env.n_trades > 0 else 1)
+    mean_ret = returns.mean() if returns.size > 0 else 0.0
+    std_ret = returns.std() + 1e-12
+    ann_factor = math.sqrt(525600.0)  # annualize minute SR
+    sr = (mean_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
+    # Calmar ratio (CR / MaxDD)
+    calmar = (cr / mpb) if mpb > 1e-12 else 0.0
+
+    # Trade-level metrics
+    wins = 0
+    losses = 0
+    trade_rets = []
+    last_trade_equity = None
+    last_trade_time = None
+    hold_minutes = []
+
+    for t in env.trade_log:
+        if last_trade_equity is None:
+            last_trade_equity = env.prev_total_value
+            last_trade_time = t["time"]
+        else:
+            # trade return measured as equity change since last trade
+            trade_ret = (env.total_value - last_trade_equity) / (last_trade_equity + 1e-8)
+            trade_rets.append(trade_ret)
+            if trade_ret > 0:
+                wins += 1
+            else:
+                losses += 1
+            if last_trade_time is not None:
+                hold_minutes.append(float((t["time"] - last_trade_time).total_seconds() / 60.0))
+            last_trade_equity = env.total_value
+            last_trade_time = t["time"]
+
+    win_rate = wins / (wins + losses + 1e-8)
+    avg_trade_ret = float(np.mean(trade_rets)) if len(trade_rets) else 0.0
+    avg_hold_mins = float(np.mean(hold_minutes)) if len(hold_minutes) else 0.0
+    turnover_total = float(np.sum([abs(x.get("cash_change", 0.0)) for x in env.trade_log])) / env.initial_balance
+
+    metrics = {
+        "CR": float(cr), "MER": float(mer), "MPB": float(mpb), "APPT": float(appt),
+        "SR": float(sr), "WinRate": float(win_rate), "Turnover": float(turnover_total),
+        "Calmar": float(calmar), "AvgTradeRet": float(avg_trade_ret), "AvgHoldMins": float(avg_hold_mins),
+        "Trades": int(env.n_trades)
+    }
+    return metrics
+
 def evaluate_env(env: BTCRLEnv, agent: PPOAgent, name: str = "Eval", verbose: bool = False) -> Dict[str, Any]:
     obs = env.reset()
     h_a, m_a = agent.actor.init_state(batch_size=1, device=agent.device)
@@ -833,11 +958,14 @@ def evaluate_env(env: BTCRLEnv, agent: PPOAgent, name: str = "Eval", verbose: bo
         obs, reward, done, info = env.step(action)
         steps += 1
         if verbose and steps % 2000 == 0:
+            eq = env.total_value
+            peak = env.peak_value
+            dd = (eq - peak) / (peak + 1e-8)
             pbar.set_postfix({
                 "Price": f"{info['price']:.2f}",
                 "Value": f"{info['value']:.2f}",
                 "Target": f"{info['target_pos']:.2f}",
-                "Ret": f"{info['log_ret']:.6f}"
+                "DD": f"{dd:.3f}"
             })
         pbar.update(1)
         if done or steps >= total_eval_steps:
@@ -845,31 +973,15 @@ def evaluate_env(env: BTCRLEnv, agent: PPOAgent, name: str = "Eval", verbose: bo
 
     pbar.close()
 
-    # Metrics
-    equity = np.array(env.equity_curve, dtype=np.float64)
-    returns = np.array(env.step_returns, dtype=np.float64)
-    init = env.initial_balance
-    final = equity[-1]
-    cr = (final - init) / init
-    mer = np.max((equity - init) / init) if equity.size > 0 else 0.0
-    # Maximum drawdown (positive number)
-    running_max = np.maximum.accumulate(equity)
-    drawdown = (equity - running_max) / (running_max + 1e-8)
-    mpb = -np.min(drawdown) if drawdown.size > 0 else 0.0
-    appt = (final - init) / (env.n_trades if env.n_trades > 0 else 1)
-    # Sharpe ratio (minute data, risk-free ~0). Annualize by sqrt(minutes/year).
-    mean_ret = returns.mean() if returns.size > 0 else 0.0
-    std_ret = returns.std() + 1e-12
-    ann_factor = math.sqrt(525600.0)
-    sr = (mean_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
-
-    metrics = {"CR": float(cr), "MER": float(mer), "MPB": float(mpb), "APPT": float(appt), "SR": float(sr)}
+    metrics = compute_backtest_metrics(env)
     return {
         "metrics": metrics,
-        "equity_curve": equity,
-        "returns": returns,
+        "equity_curve": np.array(env.equity_curve, dtype=np.float64),
+        "returns": np.array(env.step_returns, dtype=np.float64),
         "trades": env.n_trades,
-        "actions": env.actions_taken
+        "actions": env.actions_taken,
+        "drawdowns": np.array(env.drawdowns, dtype=np.float64),
+        "trade_log": env.trade_log
     }
 
 def plot_equity(equity_curve: np.ndarray, title: str):
@@ -878,6 +990,34 @@ def plot_equity(equity_curve: np.ndarray, title: str):
     plt.title(title)
     plt.xlabel("Steps")
     plt.ylabel("Portfolio Value (USD)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_drawdown(drawdowns: np.ndarray, title: str):
+    plt.figure()
+    plt.plot(drawdowns, color="red", label="Drawdown")
+    plt.title(f"{title} - Drawdown")
+    plt.xlabel("Steps")
+    plt.ylabel("Drawdown (fraction)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_rolling_sharpe(returns: np.ndarray, window: int = 1440, title: str = "Rolling Sharpe (daily)"):
+    # Approx rolling Sharpe over 1 day (1440 minutes)
+    if returns.size < window:
+        return
+    roll_mean = pd.Series(returns).rolling(window).mean().values
+    roll_std = pd.Series(returns).rolling(window).std().replace(0, np.nan).values
+    sr = np.divide(roll_mean, roll_std, out=np.zeros_like(roll_mean), where=(roll_std > 0))
+    # Annualize
+    sr = sr * math.sqrt(525600.0)
+    plt.figure()
+    plt.plot(sr, label=f"Rolling Sharpe ({window}m)")
+    plt.title(title)
+    plt.xlabel("Steps")
+    plt.ylabel("Sharpe")
     plt.legend()
     plt.grid(True)
     plt.show()
@@ -903,21 +1043,23 @@ def main():
     turbulence_threshold = 3.0
 
     # Epoch config: Use full training dataset per epoch
-    epochs = 6
+    epochs = 12
     steps_per_epoch = len(train_df) - time_window - 1
-    rollout_len = 2048
+    rollout_len = 1024
     update_epochs = 6
-    batch_size = 1024
+    batch_size = 512
 
     # Environments (same settings across splits)
     env_kwargs = dict(
         time_window=time_window,
         initial_balance=initial_balance,
         cost_rate=0.0005,
-        rebalance_threshold=0.10,
-        turnover_penalty=0.10,
+        slippage_bps=1.0,
+        rebalance_threshold=0.15,
+        turnover_penalty=0.05,
         turbulence_window=60,
         turbulence_threshold=turbulence_threshold,
+        max_dd_stop=0.25,
         feature_exclude=feature_exclude
     )
     train_env = BTCRLEnv(train_df, **env_kwargs)
@@ -934,8 +1076,8 @@ def main():
         critic_lr=3e-4,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_range=0.2,
-        entropy_coef=0.01,
+        clip_range=0.15,
+        entropy_coef=0.02,
         value_coef=0.5,
         max_grad_norm=1.0,
         device=DEVICE,
@@ -956,31 +1098,56 @@ def main():
     # Evaluate on Train (backtest on seen data)
     print("Evaluating on train data (backtest)…")
     train_eval = evaluate_env(train_env, agent, name="Train", verbose=True)
-    print(f"Train Metrics: {train_eval['metrics']}")
+    print("Train Backtest Metrics:")
+    for k, v in train_eval["metrics"].items():
+        if k != "Trades":
+            print(f" - {k}: {v:.6f}")
+        else:
+            print(f" - {k}: {v}")
+    print(f"Trade count: {train_eval['metrics']['Trades']} | Final Equity: {train_eval['equity_curve'][-1]:,.2f}")
     plot_equity(train_eval["equity_curve"], title="Train Equity Curve")
+    plot_drawdown(train_eval["drawdowns"], title="Train")
+    plot_rolling_sharpe(train_eval["returns"], window=1440, title="Train Rolling Sharpe (Daily)")
 
     # Evaluate on Validation
     print("Evaluating on validation data…")
     val_eval = evaluate_env(val_env, agent, name="Validation", verbose=True)
-    print(f"Validation Metrics: {val_eval['metrics']}")
+    print("Validation Backtest Metrics:")
+    for k, v in val_eval["metrics"].items():
+        if k != "Trades":
+            print(f" - {k}: {v:.6f}")
+        else:
+            print(f" - {k}: {v}")
+    print(f"Trade count: {val_eval['metrics']['Trades']} | Final Equity: {val_eval['equity_curve'][-1]:,.2f}")
     plot_equity(val_eval["equity_curve"], title="Validation Equity Curve")
+    plot_drawdown(val_eval["drawdowns"], title="Validation")
+    plot_rolling_sharpe(val_eval["returns"], window=1440, title="Validation Rolling Sharpe (Daily)")
 
     # Evaluate on Test (final backtest)
     print("Evaluating on test data (backtest)…")
     test_eval = evaluate_env(test_env, agent, name="Test", verbose=True)
-    print(f"Test Metrics: {test_eval['metrics']}")
+    print("Test Backtest Metrics:")
+    for k, v in test_eval["metrics"].items():
+        if k != "Trades":
+            print(f" - {k}: {v:.6f}")
+        else:
+            print(f" - {k}: {v}")
+    print(f"Trade count: {test_eval['metrics']['Trades']} | Final Equity: {test_eval['equity_curve'][-1]:,.2f}")
     plot_equity(test_eval["equity_curve"], title="Test Equity Curve")
+    plot_drawdown(test_eval["drawdowns"], title="Test")
+    plot_rolling_sharpe(test_eval["returns"], window=1440, title="Test Rolling Sharpe (Daily)")
 
-    # Print summary
+    # Print summary line
     def fmt_metrics(m: Dict[str, float]) -> str:
-        return " | ".join([f"{k}: {v:.4f}" for k, v in m.items()])
+        keys = ["CR", "MER", "MPB", "APPT", "SR", "WinRate", "Turnover", "Calmar", "AvgTradeRet", "AvgHoldMins"]
+        return " | ".join([f"{k}: {m[k]:.4f}" for k in keys])
 
     print("Summary:")
-    print(f"- Train: {fmt_metrics(train_eval['metrics'])}, Trades: {train_eval['trades']}")
-    print(f"- Val:   {fmt_metrics(val_eval['metrics'])}, Trades: {val_eval['trades']}")
-    print(f"- Test:  {fmt_metrics(test_eval['metrics'])}, Trades: {test_eval['trades']}")
+    print(f"- Train: {fmt_metrics(train_eval['metrics'])}, Trades: {train_eval['metrics']['Trades']}")
+    print(f"- Val:   {fmt_metrics(val_eval['metrics'])}, Trades: {val_eval['metrics']['Trades']}")
+    print(f"- Test:  {fmt_metrics(test_eval['metrics'])}, Trades: {test_eval['metrics']['Trades']}")
 
-    # Optional: plot actions distribution on test
+    # Action distribution on Test
     actions = test_eval["actions"]
     plt.figure()
     plt.hist(actions, bins=[-0.5, 0.5, 1.5, 2.5], rwidth=0.8)
