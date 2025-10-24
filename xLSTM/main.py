@@ -1,22 +1,16 @@
+# main.py
 # ------------------------------------------------------------
 # xLSTM + Recurrent PPO for BTC-USD intraday trading (1-min)
 # Single-file implementation with:
-#  - Data loading (from provided URL) + ta indicators + z-score
+#  - Data loading (from provided URL) + ta indicators + z-score scaling
 #  - Custom xLSTM actor/critic (stabilized)
 #  - Trading environment with target-position actions & turbulence gating
-#  - Recurrent PPO training with GAE, tqdm progress, and plots
+#  - Recurrent PPO training with GAE, tqdm progress, rolling-window training
+#  - Smaller batches, more epochs, and stronger regularization
 #  - Comprehensive backtesting metrics and prints (Train/Val/Test)
+#  - Metric definitions printed for clarity
 #
-# Notes on improvements to seek profitability over your current run:
-#  - Actions represent target position ratios (keep/0.5/1.0) to reduce churn
-#  - Rebalance only if change exceeds a threshold (avoids micro-rebalancing)
-#  - Log-return reward with turnover penalty and turbulence gating
-#  - Advantage normalization, cosine LR schedules, temperature annealing
-#  - Numerically stabilized xLSTM cell (clamps and norm) for MPS
-#  - Backtesting prints include CR, MER, MPB, APPT, SR, WinRate, Turnover,
-#    MaxDD, Calmar, AvgTradeRet, AvgHoldMins, and rolling SR/DDrawdown plots
-#
-# Keep everything in one file. Run: python main.py
+# Run: python main.py
 # ------------------------------------------------------------
 
 import os
@@ -89,7 +83,10 @@ def get_data():
         df = pd.read_csv(
             url, skiprows=[1, 2], header=0, names=column_names,
             parse_dates=["Datetime"], index_col="Datetime",
-            dtype={"Close": "float64", "High": "float64", "Low": "float64", "Open": "float64", "Volume": "float64"},
+            dtype={
+                "Close": "float64", "High": "float64", "Low": "float64",
+                "Open": "float64", "Volume": "float64"
+            },
             na_values=["NA", "N/A", "", "NaN", "nan", "INF", "-INF"],
             keep_default_na=True,
         )
@@ -98,7 +95,7 @@ def get_data():
         print(f"Error reading data: {e}")
         return pd.DataFrame()
 
-    # Forward/backward fill and drop NaNs
+    # Fill and sanitize
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.ffill(inplace=True)
     df.bfill(inplace=True)
@@ -129,7 +126,7 @@ def get_data():
     feature_cols = [c for c in df.columns if c not in ["Original_Close"]]
     df[feature_cols] = df[feature_cols].clip(-10.0, 10.0)
 
-    # Minute returns for turbulence and Sharpe calculations
+    # Minute simple returns for turbulence and Sharpe calculations
     df["Return"] = df["Original_Close"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
     print("Data loaded and preprocessed successfully.")
@@ -165,13 +162,13 @@ class BTCRLEnv:
         data: pd.DataFrame,
         time_window: int = 30,
         initial_balance: float = 1_000_000.0,
-        cost_rate: float = 0.0005,        # 0.05% per trade
-        slippage_bps: float = 1.0,        # 1 bps slippage
-        rebalance_threshold: float = 0.15,  # rebalance only if change >15% of portfolio
-        turnover_penalty: float = 0.05,     # penalize turnover in reward
-        turbulence_window: int = 60,      # minutes
+        cost_rate: float = 0.0003,         # 0.03% per trade (slightly cheaper to encourage trades)
+        slippage_bps: float = 1.0,         # 1 bps slippage
+        rebalance_threshold: float = 0.05, # rebalance if change >5% of portfolio (smaller to allow more trades)
+        turnover_penalty: float = 0.01,    # lighter penalty to promote trading
+        turbulence_window: int = 60,       # minutes
         turbulence_threshold: float = 3.0, # abs z-score threshold
-        max_dd_stop: float = 0.25,        # stop trading when DD exceeds 25%
+        max_dd_stop: float = 0.35,         # 35% DD stop
         feature_exclude: List[str] = None
     ):
         self.data = data.copy()
@@ -229,7 +226,7 @@ class BTCRLEnv:
         self.peak_value = self.initial_balance
         self.drawdowns = []
         self.actions_taken = []
-        self.trade_log = []  # detailed trade info
+        self.trade_log = []
 
         # Skip initial time window as warmup (hold)
         self.idx = max(self.idx, self.time_window - 1)
@@ -341,7 +338,7 @@ class BTCRLEnv:
         log_ret = math.log(max(self.total_value / (self.prev_total_value + 1e-12), 1e-12))
         reward = log_ret - self.turnover_penalty * turnover
         if forced_flat and action != 0:
-            reward -= 0.001  # small penalty
+            reward -= 0.001  # small penalty for attempting to change under turbulence
 
         # Track returns and drawdown
         step_ret = (self.total_value / (self.prev_total_value + 1e-8)) - 1.0
@@ -546,7 +543,7 @@ class CriticXLSTM(nn.Module):
         return self.xlstm.init_state(batch_size, device)
 
 # ---------------------------
-# PPO Agent (Recurrent, epoch-based training)
+# PPO Agent (Recurrent, epoch-based)
 # ---------------------------
 class PPOAgent:
     def __init__(
@@ -555,14 +552,14 @@ class PPOAgent:
         num_actions: int,
         hidden_size: int = 128,
         xlstm_layers: int = 2,
-        actor_lr: float = 3e-4,
-        critic_lr: float = 3e-4,
+        actor_lr: float = 2.5e-4,
+        critic_lr: float = 2.5e-4,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_range: float = 0.15,
-        entropy_coef: float = 0.02,
-        value_coef: float = 0.5,
-        max_grad_norm: float = 1.0,
+        clip_range: float = 0.12,
+        entropy_coef: float = 0.03,
+        value_coef: float = 0.6,
+        max_grad_norm: float = 0.8,
         device: torch.device = torch.device("cpu"),
     ):
         self.device = device
@@ -577,18 +574,18 @@ class PPOAgent:
         self.actor = ActorXLSTM(obs_size, hidden_size, num_actions, num_layers=xlstm_layers).to(self.device)
         self.critic = CriticXLSTM(obs_size, hidden_size, num_layers=xlstm_layers).to(self.device)
 
-        self.actor_opt = optim.Adam(self.actor.parameters(), lr=actor_lr)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=actor_lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5)
+        self.critic_opt = optim.Adam(self.critic.parameters(), lr=critic_lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5)
 
         # Learning rate schedulers (help stronger training)
-        self.actor_sched = optim.lr_scheduler.CosineAnnealingLR(self.actor_opt, T_max=100, eta_min=1e-5)
-        self.critic_sched = optim.lr_scheduler.CosineAnnealingLR(self.critic_opt, T_max=100, eta_min=1e-5)
+        self.actor_sched = optim.lr_scheduler.CosineAnnealingLR(self.actor_opt, T_max=200, eta_min=1e-5)
+        self.critic_sched = optim.lr_scheduler.CosineAnnealingLR(self.critic_opt, T_max=200, eta_min=1e-5)
 
         # Temperature for action sampling (decays over epochs to reduce exploration)
         self.temperature = 1.0
 
     def set_temperature(self, temp: float):
-        self.temperature = max(0.6, float(temp))
+        self.temperature = max(0.7, float(temp))
 
     def act(self, obs_t: np.ndarray, actor_state: Tuple[List[torch.Tensor], List[torch.Tensor]]) -> Tuple[int, float, Tuple, torch.Tensor]:
         obs_t = np.nan_to_num(obs_t, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
@@ -629,7 +626,7 @@ class PPOAgent:
         advantages = (advantages - adv_mean) / adv_std
         return advantages, returns
 
-    def update(self, rollout: Dict[str, Any], epochs: int = 6, batch_size: int = 512):
+    def update(self, rollout: Dict[str, Any], epochs: int = 8, batch_size: int = 64):
         obs = torch.tensor(rollout["obs"], device=self.device, dtype=TORCH_DTYPE)
         actions = torch.tensor(rollout["actions"], device=self.device, dtype=torch.long)
         old_logprobs = torch.tensor(rollout["logprobs"], device=self.device, dtype=TORCH_DTYPE)
@@ -661,7 +658,7 @@ class PPOAgent:
                 mb_advantages = advantages[mb_idx]
                 mb_returns = returns[mb_idx]
 
-                # Reset recurrent states for mini-batch (approximate; proper recurrent PPO needs sequence batching)
+                # Reset recurrent states for mini-batch (approximate)
                 h_a, m_a = self.actor.init_state(batch_size=mb_obs.shape[0], device=self.device)
                 logits, _, _ = self.actor(mb_obs, h_a, m_a)
                 logits = safe_tensor(logits, clamp_val=20.0)
@@ -716,173 +713,157 @@ class PPOAgent:
         return stats
 
 # ---------------------------
-# Training Loop (epoch-based)
+# Training Helpers
 # ---------------------------
-def train_agent(
+def ppo_train_epoch(
     env: BTCRLEnv,
     agent: PPOAgent,
-    epochs: int = 12,
-    steps_per_epoch: int = None,  # default: full dataset
-    rollout_len: int = 1_024,
-    update_epochs: int = 6,
-    batch_size: int = 512,
+    steps_per_epoch: int,
+    rollout_len: int,
+    update_epochs: int,
+    batch_size: int,
+    desc_prefix: str = ""
 ) -> Dict[str, Any]:
-    # Use full training data per epoch by default
-    if steps_per_epoch is None:
-        steps_per_epoch = max(1, len(env.data) - env.time_window - 1)
-
     obs = env.reset()
     h_a, m_a = agent.actor.init_state(batch_size=1, device=agent.device)
     h_c, m_c = agent.critic.init_state(batch_size=1, device=agent.device)
 
-    all_stats = []
-    total_steps_done = 0
+    pbar = tqdm(total=steps_per_epoch, desc=desc_prefix, leave=True)
+    ep_stats = []
+    ep_rewards = []
+    ep_actions = []
+    ep_turnover = 0.0
+    start_value = env.total_value
+    steps_done = 0
 
-    print("Starting training (epoch-based) with full training data per epoch…")
-    for ep in range(1, epochs + 1):
-        # Anneal exploration temperature each epoch
-        agent.set_temperature(temp=max(0.6, 1.0 - 0.04 * (ep - 1)))
+    while steps_done < steps_per_epoch:
+        rollout = {
+            "obs": [],
+            "actions": [],
+            "logprobs": [],
+            "rewards": [],
+            "values": [],
+            "dones": [],
+        }
 
-        pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {ep}/{epochs}", leave=True)
-        ep_stats = []
-        ep_rewards = []
-        ep_actions = []
-        ep_turnover = 0.0
-        start_value = env.total_value
+        inner_len = min(rollout_len, steps_per_epoch - steps_done)
+        for _ in range(inner_len):
+            action, logprob, (h_a, m_a), _ = agent.act(obs, (h_a, m_a))
+            value, (h_c, m_c) = agent.value(obs, (h_c, m_c))
 
-        steps_this_epoch = 0
-        last_print_value = env.total_value
+            next_obs, reward, done, info = env.step(action)
 
-        while steps_this_epoch < steps_per_epoch:
-            # Rollout buffer
-            rollout = {
-                "obs": [],
-                "actions": [],
-                "logprobs": [],
-                "rewards": [],
-                "values": [],
-                "dones": [],
-            }
+            rollout["obs"].append(obs)
+            rollout["actions"].append(action)
+            rollout["logprobs"].append(logprob)
+            rollout["rewards"].append(reward)
+            rollout["values"].append(value)
+            rollout["dones"].append(1.0 if done else 0.0)
 
-            # Collect rollout
-            inner_len = min(rollout_len, steps_per_epoch - steps_this_epoch)
-            for _ in range(inner_len):
-                action, logprob, (h_a, m_a), _ = agent.act(obs, (h_a, m_a))
-                value, (h_c, m_c) = agent.value(obs, (h_c, m_c))
+            obs = next_obs
+            steps_done += 1
+            pbar.update(1)
 
-                next_obs, reward, done, info = env.step(action)
+            ep_rewards.append(reward)
+            ep_actions.append(action)
+            ep_turnover += info.get("turnover", 0.0)
 
-                rollout["obs"].append(obs)
-                rollout["actions"].append(action)
-                rollout["logprobs"].append(logprob)
-                rollout["rewards"].append(reward)
-                rollout["values"].append(value)
-                rollout["dones"].append(1.0 if done else 0.0)
+            if steps_done % 4000 == 0:
+                eq = env.total_value
+                peak = env.peak_value
+                dd = (eq - peak) / (peak + 1e-8)
+                returns = np.array(env.step_returns[-4000:], dtype=np.float64)
+                mean_ret = float(returns.mean()) if returns.size else 0.0
+                std_ret = float(returns.std()) + 1e-12
+                ann_factor = math.sqrt(525600.0)
+                sr = (mean_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
+                pbar.set_postfix({
+                    "Equity": f"{eq:,.0f}",
+                    "DD": f"{dd:.3f}",
+                    "SR": f"{sr:.2f}",
+                    "Turnover": f"{ep_turnover:.2f}"
+                })
 
-                obs = next_obs
-                steps_this_epoch += 1
-                total_steps_done += 1
-                pbar.update(1)
+            if done:
+                obs = env.reset()
+                h_a, m_a = agent.actor.init_state(batch_size=1, device=agent.device)
+                h_c, m_c = agent.critic.init_state(batch_size=1, device=agent.device)
 
-                # Monitoring
-                ep_rewards.append(reward)
-                ep_actions.append(action)
-                ep_turnover += info.get("turnover", 0.0)
+            if steps_done >= steps_per_epoch:
+                break
 
-                if steps_this_epoch % 5000 == 0:
-                    # Periodic performance snapshot
-                    eq = env.total_value
-                    peak = env.peak_value
-                    dd = (eq - peak) / (peak + 1e-8)
-                    returns = np.array(env.step_returns[-5000:], dtype=np.float64)
-                    mean_ret = float(returns.mean()) if returns.size else 0.0
-                    std_ret = float(returns.std()) + 1e-12
-                    ann_factor = math.sqrt(525600.0)
-                    sr = (mean_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
-                    pbar.set_postfix({
-                        "Equity": f"{eq:,.0f}",
-                        "DD": f"{dd:.3f}",
-                        "SR": f"{sr:.2f}",
-                        "Turnover": f"{ep_turnover:.2f}"
-                    })
+        # Bootstrap value for GAE
+        last_value, _ = agent.value(obs, (h_c, m_c))
+        adv, returns = agent.compute_gae(
+            rewards=np.array(rollout["rewards"], dtype=np.float32),
+            values=np.array(rollout["values"], dtype=np.float32),
+            dones=np.array(rollout["dones"], dtype=np.float32),
+            last_value=last_value
+        )
 
-                if done:
-                    # Reset environment and states
-                    obs = env.reset()
-                    h_a, m_a = agent.actor.init_state(batch_size=1, device=agent.device)
-                    h_c, m_c = agent.critic.init_state(batch_size=1, device=agent.device)
+        rollout_np = {
+            "obs": np.stack(rollout["obs"]).astype(np.float32),
+            "actions": np.array(rollout["actions"], dtype=np.int64),
+            "logprobs": np.array(rollout["logprobs"], dtype=np.float32),
+            "advantages": adv.astype(np.float32),
+            "returns": returns.astype(np.float32),
+        }
 
-                if steps_this_epoch >= steps_per_epoch:
-                    break
+        stats = agent.update(rollout_np, epochs=update_epochs, batch_size=batch_size)
+        ep_stats.append(stats)
 
-            # Bootstrap value for GAE
-            last_value, _ = agent.value(obs, (h_c, m_c))
-            adv, returns = agent.compute_gae(
-                rewards=np.array(rollout["rewards"], dtype=np.float32),
-                values=np.array(rollout["values"], dtype=np.float32),
-                dones=np.array(rollout["dones"], dtype=np.float32),
-                last_value=last_value
-            )
-
-            # Prepare arrays
-            rollout_np = {
-                "obs": np.stack(rollout["obs"]).astype(np.float32),
-                "actions": np.array(rollout["actions"], dtype=np.int64),
-                "logprobs": np.array(rollout["logprobs"], dtype=np.float32),
-                "advantages": adv.astype(np.float32),
-                "returns": returns.astype(np.float32),
-            }
-
-            stats = agent.update(rollout_np, epochs=update_epochs, batch_size=batch_size)
-            ep_stats.append(stats)
-
-            # Show partial stats on pbar
-            pbar.set_postfix({
-                "AL": f"{stats['actor_loss']:.3f}",
-                "CL": f"{stats['critic_loss']:.3f}",
-                "Ent": f"{stats['entropy']:.3f}",
-                "KL": f"{stats['approx_kl']:.3f}",
-                "EV": f"{stats['explained_var']:.3f}",
-            })
-
-        pbar.close()
-        # Epoch summary metrics
-        end_value = env.total_value
-        epoch_return = (end_value - start_value) / start_value
-        avg_reward = np.mean(ep_rewards) if ep_rewards else 0.0
-        action_counts = {0: 0, 1: 0, 2: 0}
-        for a in ep_actions:
-            action_counts[a] = action_counts.get(a, 0) + 1
-        total_actions = max(1, len(ep_actions))
-        action_dist = {k: v / total_actions for k, v in action_counts.items()}
-        mean_actor = np.mean([s["actor_loss"] for s in ep_stats]) if ep_stats else 0.0
-        mean_critic = np.mean([s["critic_loss"] for s in ep_stats]) if ep_stats else 0.0
-        mean_entropy = np.mean([s["entropy"] for s in ep_stats]) if ep_stats else 0.0
-        mean_kl = np.mean([s["approx_kl"] for s in ep_stats]) if ep_stats else 0.0
-        mean_ev = np.mean([s["explained_var"] for s in ep_stats]) if ep_stats else 0.0
-
-        print(f"Epoch {ep} Summary | "
-              f"ActorLoss: {mean_actor:.4f} | CriticLoss: {mean_critic:.4f} | Entropy: {mean_entropy:.4f} | "
-              f"KL: {mean_kl:.4f} | EV: {mean_ev:.4f} | "
-              f"AvgReward: {avg_reward:.6f} | Turnover: {ep_turnover:.4f} | "
-              f"ActionDist: {action_dist} | "
-              f"EpochReturn: {epoch_return:.4f} | Temp: {agent.temperature:.2f} | Trades: {env.n_trades}")
-
-        all_stats.append({
-            "epoch": ep,
-            "actor_loss": mean_actor,
-            "critic_loss": mean_critic,
-            "entropy": mean_entropy,
-            "approx_kl": mean_kl,
-            "explained_var": mean_ev,
-            "avg_reward": avg_reward,
-            "turnover": ep_turnover,
-            "action_dist": action_dist,
-            "epoch_return": epoch_return,
-            "trades": env.n_trades
+        pbar.set_postfix({
+            "AL": f"{stats['actor_loss']:.3f}",
+            "CL": f"{stats['critic_loss']:.3f}",
+            "Ent": f"{stats['entropy']:.3f}",
+            "KL": f"{stats['approx_kl']:.3f}",
+            "EV": f"{stats['explained_var']:.3f}",
         })
 
-    return {"train_stats": all_stats, "total_steps": total_steps_done}
+    pbar.close()
+    end_value = env.total_value
+    epoch_return = (end_value - start_value) / start_value
+    avg_reward = np.mean(ep_rewards) if ep_rewards else 0.0
+    action_counts = {0: 0, 1: 0, 2: 0}
+    for a in ep_actions:
+        action_counts[a] = action_counts.get(a, 0) + 1
+    total_actions = max(1, len(ep_actions))
+    action_dist = {k: v / total_actions for k, v in action_counts.items()}
+    mean_actor = np.mean([s["actor_loss"] for s in ep_stats]) if ep_stats else 0.0
+    mean_critic = np.mean([s["critic_loss"] for s in ep_stats]) if ep_stats else 0.0
+    mean_entropy = np.mean([s["entropy"] for s in ep_stats]) if ep_stats else 0.0
+    mean_kl = np.mean([s["approx_kl"] for s in ep_stats]) if ep_stats else 0.0
+    mean_ev = np.mean([s["explained_var"] for s in ep_stats]) if ep_stats else 0.0
+
+    summary = {
+        "actor_loss": mean_actor,
+        "critic_loss": mean_critic,
+        "entropy": mean_entropy,
+        "approx_kl": mean_kl,
+        "explained_var": mean_ev,
+        "avg_reward": avg_reward,
+        "turnover": ep_turnover,
+        "action_dist": action_dist,
+        "epoch_return": epoch_return,
+        "trades": env.n_trades
+    }
+    return summary
+
+def generate_rolling_windows(df: pd.DataFrame, window_len: int, step_len: int) -> List[pd.DataFrame]:
+    windows = []
+    n = len(df)
+    if window_len >= n:
+        return [df.copy()]
+    start = 0
+    while start + window_len <= n:
+        windows.append(df.iloc[start:start + window_len].copy())
+        start += step_len
+    # ensure last window includes the end
+    if windows and windows[-1].index[-1] != df.index[-1]:
+        windows.append(df.iloc[-window_len:].copy())
+    elif not windows:
+        windows.append(df.copy())
+    return windows
 
 # ---------------------------
 # Evaluation and Backtesting
@@ -902,24 +883,26 @@ def compute_backtest_metrics(env: BTCRLEnv) -> Dict[str, float]:
     std_ret = returns.std() + 1e-12
     ann_factor = math.sqrt(525600.0)  # annualize minute SR
     sr = (mean_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
-    # Calmar ratio (CR / MaxDD)
-    calmar = (cr / mpb) if mpb > 1e-12 else 0.0
+    max_dd = float(mpb)  # same as MPB here (fraction)
+    calmar = (cr / max_dd) if max_dd > 1e-12 else 0.0
 
-    # Trade-level metrics
+    # Trade-level metrics (approximate using trade log equity deltas)
     wins = 0
     losses = 0
     trade_rets = []
-    last_trade_equity = None
+    last_equity_ref = None
     last_trade_time = None
     hold_minutes = []
 
+    # Construct equity series aligned with indices
+    # For simplicity, measure return between consecutive trades
     for t in env.trade_log:
-        if last_trade_equity is None:
-            last_trade_equity = env.prev_total_value
+        eq_now = env.total_value  # approximation at end
+        if last_equity_ref is None:
+            last_equity_ref = env.prev_total_value
             last_trade_time = t["time"]
         else:
-            # trade return measured as equity change since last trade
-            trade_ret = (env.total_value - last_trade_equity) / (last_trade_equity + 1e-8)
+            trade_ret = (env.total_value - last_equity_ref) / (last_equity_ref + 1e-8)
             trade_rets.append(trade_ret)
             if trade_ret > 0:
                 wins += 1
@@ -927,7 +910,7 @@ def compute_backtest_metrics(env: BTCRLEnv) -> Dict[str, float]:
                 losses += 1
             if last_trade_time is not None:
                 hold_minutes.append(float((t["time"] - last_trade_time).total_seconds() / 60.0))
-            last_trade_equity = env.total_value
+            last_equity_ref = env.total_value
             last_trade_time = t["time"]
 
     win_rate = wins / (wins + losses + 1e-8)
@@ -957,7 +940,7 @@ def evaluate_env(env: BTCRLEnv, agent: PPOAgent, name: str = "Eval", verbose: bo
         action, logprob, (h_a, m_a), logits = agent.act(obs, (h_a, m_a))
         obs, reward, done, info = env.step(action)
         steps += 1
-        if verbose and steps % 2000 == 0:
+        if verbose and steps % 3000 == 0:
             eq = env.total_value
             peak = env.peak_value
             dd = (eq - peak) / (peak + 1e-8)
@@ -1005,13 +988,11 @@ def plot_drawdown(drawdowns: np.ndarray, title: str):
     plt.show()
 
 def plot_rolling_sharpe(returns: np.ndarray, window: int = 1440, title: str = "Rolling Sharpe (daily)"):
-    # Approx rolling Sharpe over 1 day (1440 minutes)
     if returns.size < window:
         return
     roll_mean = pd.Series(returns).rolling(window).mean().values
     roll_std = pd.Series(returns).rolling(window).std().replace(0, np.nan).values
     sr = np.divide(roll_mean, roll_std, out=np.zeros_like(roll_mean), where=(roll_std > 0))
-    # Annualize
     sr = sr * math.sqrt(525600.0)
     plt.figure()
     plt.plot(sr, label=f"Rolling Sharpe ({window}m)")
@@ -1021,6 +1002,20 @@ def plot_rolling_sharpe(returns: np.ndarray, window: int = 1440, title: str = "R
     plt.legend()
     plt.grid(True)
     plt.show()
+
+def print_metric_meanings():
+    print("Backtest Metric Meanings:")
+    print(" - CR (Cumulative Return): (Final Equity - Initial Equity) / Initial Equity.")
+    print(" - MER (Max Earning Rate): Max equity growth relative to initial equity over time.")
+    print(" - MPB (Maximum PullBack): Maximum drawdown (peak-to-trough) as a fraction.")
+    print(" - APPT (Avg Profitability Per Trade): (Final Equity - Initial Equity) / Number of trades.")
+    print(" - SR (Sharpe Ratio): Annualized Sharpe using 1-min returns.")
+    print(" - WinRate: Proportion of profitable trades among all trades.")
+    print(" - Turnover: Total notional traded divided by initial equity.")
+    print(" - Calmar: CR / Maximum Drawdown (higher is better).")
+    print(" - AvgTradeRet: Average return per trade (approx, based on trade-to-trade equity changes).")
+    print(" - AvgHoldMins: Average minutes between consecutive trades.")
+    print(" - Trades: Total number of executed trades.")
 
 # ---------------------------
 # Main
@@ -1042,62 +1037,127 @@ def main():
     initial_balance = 1_000_000.0
     turbulence_threshold = 3.0
 
-    # Epoch config: Use full training dataset per epoch
-    epochs = 12
-    steps_per_epoch = len(train_df) - time_window - 1
+    # Rolling window training config
+    # Cover the full training set using overlapping windows (walk-forward training)
+    window_len = min(len(train_df), 30000)   # ~3 weeks of minutes per window if available
+    step_len = max(5000, window_len // 3)    # slide forward by ~1/3 window
+    roll_windows = generate_rolling_windows(train_df, window_len=window_len, step_len=step_len)
+    print(f"Rolling windows for training: {len(roll_windows)} (len={window_len}, step={step_len})")
+
+    # Training loop config
+    global_epochs = 24             # more epochs
     rollout_len = 1024
     update_epochs = 6
-    batch_size = 512
+    batch_size = 64                # smaller batches
+    steps_per_window = None        # use full window
+    save_dir = "./checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+    best_val_calmar = -1e9
 
-    # Environments (same settings across splits)
-    env_kwargs = dict(
-        time_window=time_window,
-        initial_balance=initial_balance,
-        cost_rate=0.0005,
-        slippage_bps=1.0,
-        rebalance_threshold=0.15,
-        turnover_penalty=0.05,
-        turbulence_window=60,
-        turbulence_threshold=turbulence_threshold,
-        max_dd_stop=0.25,
-        feature_exclude=feature_exclude
-    )
-    train_env = BTCRLEnv(train_df, **env_kwargs)
-    val_env = BTCRLEnv(val_df, **env_kwargs)
-    test_env = BTCRLEnv(test_df, **env_kwargs)
-
-    # Agent (deeper xLSTM for stronger modeling)
+    # Agent
     agent = PPOAgent(
         obs_size=obs_size,
         num_actions=3,
         hidden_size=128,
         xlstm_layers=2,
-        actor_lr=3e-4,
-        critic_lr=3e-4,
+        actor_lr=2.5e-4,
+        critic_lr=2.5e-4,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_range=0.15,
-        entropy_coef=0.02,
-        value_coef=0.5,
-        max_grad_norm=1.0,
+        clip_range=0.12,
+        entropy_coef=0.03,
+        value_coef=0.6,
+        max_grad_norm=0.8,
         device=DEVICE,
     )
 
-    print("Starting training (epoch-based) with full training data per epoch…")
-    train_info = train_agent(
-        env=train_env,
-        agent=agent,
-        epochs=epochs,
-        steps_per_epoch=steps_per_epoch,
-        rollout_len=rollout_len,
-        update_epochs=update_epochs,
-        batch_size=batch_size,
-    )
-    print("Training completed.")
+    # Training (rolling windows each epoch)
+    for ep in range(1, global_epochs + 1):
+        # Anneal exploration temperature each global epoch
+        agent.set_temperature(temp=max(0.7, 1.0 - 0.03 * (ep - 1)))
+        print(f"\n=== Global Epoch {ep}/{global_epochs} | Temp: {agent.temperature:.2f} ===")
 
-    # Evaluate on Train (backtest on seen data)
-    print("Evaluating on train data (backtest)…")
-    train_eval = evaluate_env(train_env, agent, name="Train", verbose=True)
+        epoch_summaries = []
+        for wi, wdf in enumerate(roll_windows, start=1):
+            env_kwargs = dict(
+                time_window=time_window,
+                initial_balance=initial_balance,
+                cost_rate=0.0003,
+                slippage_bps=1.0,
+                rebalance_threshold=0.05,
+                turnover_penalty=0.01,
+                turbulence_window=60,
+                turbulence_threshold=turbulence_threshold,
+                max_dd_stop=0.35,
+                feature_exclude=feature_exclude
+            )
+            train_env = BTCRLEnv(wdf, **env_kwargs)
+            steps_per_epoch = len(wdf) - time_window - 1
+            if steps_per_epoch <= 0:
+                continue
+            desc = f"Ep {ep}/{global_epochs} | Win {wi}/{len(roll_windows)}"
+            summary = ppo_train_epoch(
+                env=train_env,
+                agent=agent,
+                steps_per_epoch=steps_per_epoch if steps_per_window is None else min(steps_per_window, steps_per_epoch),
+                rollout_len=rollout_len,
+                update_epochs=update_epochs,
+                batch_size=batch_size,
+                desc_prefix=desc
+            )
+            print(f"Window {wi} Summary | "
+                  f"AL: {summary['actor_loss']:.4f} | CL: {summary['critic_loss']:.4f} | Ent: {summary['entropy']:.4f} | "
+                  f"KL: {summary['approx_kl']:.4f} | EV: {summary['explained_var']:.4f} | "
+                  f"AvgR: {summary['avg_reward']:.6f} | Turnover: {summary['turnover']:.3f} | "
+                  f"ActionDist: {summary['action_dist']} | "
+                  f"Ret: {summary['epoch_return']:.4f} | Trades: {summary['trades']}")
+            epoch_summaries.append(summary)
+
+        # Validation after each global epoch
+        val_env = BTCRLEnv(val_df, time_window=time_window, initial_balance=initial_balance,
+                           cost_rate=0.0003, slippage_bps=1.0, rebalance_threshold=0.05,
+                           turnover_penalty=0.01, turbulence_window=60,
+                           turbulence_threshold=turbulence_threshold, max_dd_stop=0.35,
+                           feature_exclude=feature_exclude)
+        val_eval = evaluate_env(val_env, agent, name=f"Val Ep{ep}", verbose=False)
+        val_m = val_eval["metrics"]
+        print("\nValidation Backtest Metrics:")
+        for k, v in val_m.items():
+            if k != "Trades":
+                print(f" - {k}: {v:.6f}")
+            else:
+                print(f" - {k}: {v}")
+
+        # Save best checkpoint by Calmar (or CR as tie-breaker)
+        calmar = val_m.get("Calmar", 0.0)
+        cr = val_m.get("CR", -1e9)
+        if (calmar > best_val_calmar) or (math.isclose(calmar, best_val_calmar) and cr > 0):
+            best_val_calmar = calmar
+            torch.save(agent.actor.state_dict(), os.path.join(save_dir, "best_actor.pth"))
+            torch.save(agent.critic.state_dict(), os.path.join(save_dir, "best_critic.pth"))
+            print(f"Saved new best model (Calmar: {calmar:.4f})")
+
+    print("\nTraining completed.")
+
+    # Load best checkpoint (if exists) for final backtests
+    actor_ckpt = os.path.join(save_dir, "best_actor.pth")
+    critic_ckpt = os.path.join(save_dir, "best_critic.pth")
+    if os.path.isfile(actor_ckpt) and os.path.isfile(critic_ckpt):
+        agent.actor.load_state_dict(torch.load(actor_ckpt, map_location=DEVICE))
+        agent.critic.load_state_dict(torch.load(critic_ckpt, map_location=DEVICE))
+        print("Loaded best checkpoint for evaluation.")
+
+    # Print metric meanings first
+    print_metric_meanings()
+
+    # Evaluate on Train (full backtest on seen data)
+    print("\nEvaluating on train data (backtest)…")
+    train_env_full = BTCRLEnv(train_df, time_window=time_window, initial_balance=initial_balance,
+                               cost_rate=0.0003, slippage_bps=1.0, rebalance_threshold=0.05,
+                               turnover_penalty=0.01, turbulence_window=60,
+                               turbulence_threshold=turbulence_threshold, max_dd_stop=0.35,
+                               feature_exclude=feature_exclude)
+    train_eval = evaluate_env(train_env_full, agent, name="Train", verbose=True)
     print("Train Backtest Metrics:")
     for k, v in train_eval["metrics"].items():
         if k != "Trades":
@@ -1109,9 +1169,14 @@ def main():
     plot_drawdown(train_eval["drawdowns"], title="Train")
     plot_rolling_sharpe(train_eval["returns"], window=1440, title="Train Rolling Sharpe (Daily)")
 
-    # Evaluate on Validation
-    print("Evaluating on validation data…")
-    val_eval = evaluate_env(val_env, agent, name="Validation", verbose=True)
+    # Evaluate on Validation (again, final report)
+    print("\nEvaluating on validation data…")
+    val_env_full = BTCRLEnv(val_df, time_window=time_window, initial_balance=initial_balance,
+                             cost_rate=0.0003, slippage_bps=1.0, rebalance_threshold=0.05,
+                             turnover_penalty=0.01, turbulence_window=60,
+                             turbulence_threshold=turbulence_threshold, max_dd_stop=0.35,
+                             feature_exclude=feature_exclude)
+    val_eval = evaluate_env(val_env_full, agent, name="Validation", verbose=True)
     print("Validation Backtest Metrics:")
     for k, v in val_eval["metrics"].items():
         if k != "Trades":
@@ -1124,7 +1189,12 @@ def main():
     plot_rolling_sharpe(val_eval["returns"], window=1440, title="Validation Rolling Sharpe (Daily)")
 
     # Evaluate on Test (final backtest)
-    print("Evaluating on test data (backtest)…")
+    print("\nEvaluating on test data (backtest)…")
+    test_env = BTCRLEnv(test_df, time_window=time_window, initial_balance=initial_balance,
+                         cost_rate=0.0003, slippage_bps=1.0, rebalance_threshold=0.05,
+                         turnover_penalty=0.01, turbulence_window=60,
+                         turbulence_threshold=turbulence_threshold, max_dd_stop=0.35,
+                         feature_exclude=feature_exclude)
     test_eval = evaluate_env(test_env, agent, name="Test", verbose=True)
     print("Test Backtest Metrics:")
     for k, v in test_eval["metrics"].items():
@@ -1142,7 +1212,7 @@ def main():
         keys = ["CR", "MER", "MPB", "APPT", "SR", "WinRate", "Turnover", "Calmar", "AvgTradeRet", "AvgHoldMins"]
         return " | ".join([f"{k}: {m[k]:.4f}" for k in keys])
 
-    print("Summary:")
+    print("\nSummary:")
     print(f"- Train: {fmt_metrics(train_eval['metrics'])}, Trades: {train_eval['metrics']['Trades']}")
     print(f"- Val:   {fmt_metrics(val_eval['metrics'])}, Trades: {val_eval['metrics']['Trades']}")
     print(f"- Test:  {fmt_metrics(test_eval['metrics'])}, Trades: {test_eval['metrics']['Trades']}")
