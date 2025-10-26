@@ -1,6 +1,6 @@
 # Crypto Trading Points with Deep Reinforcement Learning Approach
 
-Please write the python code generate the model described in this paper. If possible write it inside a simple file. Please make plotly plots and show them. Download the data from here:
+Please write the python code generate the model described in this paper. If possible write it inside a simple file. Please make plotly plots and show them. Download the data from here. Im on a mac machine, then i have mps. Please if cuda available, also use it(if i run the script in another machine):
     data_url = "https://raw.githubusercontent.com/H3cth0r/stonks-data/refs/heads/main/data/CRYPTO/BTC-USD/data_0.csv"
 
     data_df_raw = load_raw_data(data_url)
