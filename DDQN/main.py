@@ -1,30 +1,26 @@
-# Requirements (install before running):
-# pip install pandas numpy ta plotly tqdm scikit-learn torch
-
 import os
 import math
 import time
 import warnings
-warnings.filterwarnings("ignore")
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import pandas as pd
-
-from tqdm import tqdm, trange
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
-from sklearn.preprocessing import StandardScaler
+import torch.optim as optim
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# --------------------------------------------------------------------------------------
-# Data loader (exactly as requested)
-# --------------------------------------------------------------------------------------
+import ta
+
+warnings.filterwarnings("ignore")
+
 def load_data() -> pd.DataFrame:
     url = "https://raw.githubusercontent.com/H3cth0r/stonks-data/refs/heads/main/data/CRYPTO/BTC-USD/data_0.csv"
     column_names = ["Datetime", "Close", "High", "Low", "Open", "Volume"]
@@ -37,745 +33,727 @@ def load_data() -> pd.DataFrame:
     df = df.sort_index()
     return df
 
-# --------------------------------------------------------------------------------------
-# Configurations derived from both papers and user requirements
-# --------------------------------------------------------------------------------------
-class Config:
-    # Device selection with mps if available (Apple), else cuda, else cpu
-    DEVICE = (
-        torch.device("mps") if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        else torch.device("cuda") if torch.cuda.is_available()
-        else torch.device("cpu")
-    )
+# -----------------------------
+# Feature engineering with `ta`
+# -----------------------------
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # Basic returns
+    df["ret1"] = df["Close"].pct_change().fillna(0.0)
+    df["logret1"] = np.log1p(df["ret1"]).fillna(0.0)
 
-    # DRL hyperparameters (Tran et al. 2023)
-    EPISODES = 50              # You can raise to 100 for full training, kept moderate to be runnable
-    BATCH_SIZE = 40
-    REPLAY_SIZE = 10_000
-    TARGET_UPDATE_EVERY = 10
-    GAMMA = 0.98
-    LR_Q = 1e-3
-    LR_REWARD = 1e-3
-    EPS_START = 1.0
-    EPS_END = 0.12
-    EPS_DECAY_STEPS = 300
+    # RSI
+    rsi = ta.momentum.RSIIndicator(close=df["Close"], window=14)
+    df["rsi"] = rsi.rsi()
 
-    # Self-Rewarding (Huang et al. 2024) parameters
-    REWARD_WINDOW_K = 30  # short-term horizon for Sharpe/MinMax (minutes)
-    USE_SELF_REWARD = True
-    # Shared buffer and synchronous updates are the default in this implementation.
+    # MACD
+    macd_ind = ta.trend.MACD(close=df["Close"], window_slow=26, window_fast=12, window_sign=9)
+    df["macd"] = macd_ind.macd()
+    df["macd_signal"] = macd_ind.macd_signal()
+    df["macd_hist"] = macd_ind.macd_diff()
 
-    # Trading parameters consistent with paper settings
-    INITIAL_CASH = 1_000_000.0
-    FEE_RATE = 0.001  # 0.1% per trade
-    TRADE_FRACTION = 0.98  # invest nearly all available cash when buying (simplified)
+    # EMAs
+    df["ema_12"] = ta.trend.EMAIndicator(close=df["Close"], window=12).ema_indicator()
+    df["ema_26"] = ta.trend.EMAIndicator(close=df["Close"], window=26).ema_indicator()
 
-    # State representation
-    STATE_WINDOW = 60  # minutes; input to CNN
-    FEATURES = ["Close", "Open", "High", "Low", "Volume", "RSI", "Ret"]
-    NUM_ACTIONS = 3  # 0: hold, 1: buy, 2: sell
+    # ATR
+    atr = ta.volatility.AverageTrueRange(high=df["High"], low=df["Low"], close=df["Close"], window=14)
+    df["atr"] = atr.average_true_range()
 
-    # Walk-forward evaluation
-    TEST_SPLIT = 0.2  # last 20% of data for testing
-    RANDOM_SEED = 42
-
-    # Evaluation annualization (minute data)
-    MINUTES_PER_YEAR = 365 * 24 * 60
-
-# --------------------------------------------------------------------------------------
-# Features: RSI using ta; returns; scaling
-# --------------------------------------------------------------------------------------
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Use ta for RSI
+    # MFI
     try:
-        import ta
-    except ImportError:
-        raise RuntimeError("Please install 'ta' with: pip install ta")
+        mfi_ind = ta.volume.MFIIndicator(high=df["High"], low=df["Low"], close=df["Close"], volume=df["Volume"], window=14)
+        df["mfi"] = mfi_ind.money_flow_index()
+    except Exception:
+        df["mfi"] = np.nan
 
-    # RSI(14)
-    rsi = ta.momentum.RSIIndicator(close=df["Close"], window=14).rsi()
-    df["RSI"] = rsi
-
-    # Minute returns
-    df["Ret"] = df["Close"].pct_change().fillna(0.0)
-
-    # Clean up potential NaNs
-    df = df.dropna()
+    # Fill and clean
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df = df.fillna(method="ffill").fillna(method="bfill")
     return df
 
-def split_train_test(df: pd.DataFrame, test_ratio: float = 0.2):
-    n = len(df)
-    test_size = int(n * test_ratio)
-    train_df = df.iloc[:-test_size]
-    test_df = df.iloc[-test_size:]
-    return train_df, test_df
+# --------------------------------------------
+# Utility functions for metrics and processing
+# --------------------------------------------
+def sharpe_ratio(returns: np.ndarray, eps: float = 1e-9) -> float:
+    m = np.mean(returns)
+    s = np.std(returns)
+    if s < eps:
+        return 0.0
+    return m / (s + eps)
 
-def prepare_scalers(train_df: pd.DataFrame, feature_cols):
-    scaler = StandardScaler()
-    scaler.fit(train_df[feature_cols].values)
-    return scaler
+def max_drawdown(series: np.ndarray) -> float:
+    if len(series) == 0:
+        return 0.0
+    peak = np.maximum.accumulate(series)
+    drawdown = (series - peak) / peak
+    return -np.min(drawdown)
 
-def transform_features(df: pd.DataFrame, scaler: StandardScaler, feature_cols):
-    X = scaler.transform(df[feature_cols].values)
-    return X
-
-# --------------------------------------------------------------------------------------
-# Replay Buffer
-# --------------------------------------------------------------------------------------
+# --------------------------------
+# Replay Buffer with shared labels
+# --------------------------------
 class ReplayBuffer:
-    def __init__(self, capacity):
+    def __init__(self, capacity: int, state_shape: Tuple[int, int], device):
         self.capacity = capacity
-        self.buffer = []
-        self.pos = 0
+        self.device = device
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.next_states = []
+        self.dones = []
+        self.reward_labels = []  # vector of rewards per action (for reward net)
 
-    def push(self, state, action, reward, next_state, done, rlt_vec):
-        item = (state, action, reward, next_state, done, rlt_vec)
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(item)
-        else:
-            self.buffer[self.pos] = item
-        self.pos = (self.pos + 1) % self.capacity
+    def push(self, state: torch.Tensor, action: int, reward: float, next_state: torch.Tensor, done: bool, r_label_vec: torch.Tensor):
+        if len(self.states) >= self.capacity:
+            # FIFO
+            self.states.pop(0)
+            self.actions.pop(0)
+            self.rewards.pop(0)
+            self.next_states.pop(0)
+            self.dones.pop(0)
+            self.reward_labels.pop(0)
+        self.states.append(state.detach())
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.next_states.append(next_state.detach())
+        self.dones.append(done)
+        self.reward_labels.append(r_label_vec.detach())
 
-    def sample(self, batch_size):
-        idx = np.random.choice(len(self.buffer), size=batch_size, replace=False)
-        batch = [self.buffer[i] for i in idx]
-        states, actions, rewards, next_states, dones, rlt_vecs = zip(*batch)
-        return (
-            torch.tensor(np.stack(states), dtype=torch.float32),
-            torch.tensor(actions, dtype=torch.long),
-            torch.tensor(rewards, dtype=torch.float32),
-            torch.tensor(np.stack(next_states), dtype=torch.float32),
-            torch.tensor(dones, dtype=torch.float32),
-            torch.tensor(np.stack(rlt_vecs), dtype=torch.float32),
-        )
+    def sample(self, batch_size: int):
+        idxs = np.random.randint(0, len(self.states), size=batch_size)
+        s = torch.stack([self.states[i] for i in idxs]).to(self.device)
+        a = torch.tensor([self.actions[i] for i in idxs], dtype=torch.long, device=self.device)
+        r = torch.tensor([self.rewards[i] for i in idxs], dtype=torch.float32, device=self.device)
+        ns = torch.stack([self.next_states[i] for i in idxs]).to(self.device)
+        d = torch.tensor([self.dones[i] for i in idxs], dtype=torch.bool, device=self.device)
+        rl = torch.stack([self.reward_labels[i] for i in idxs]).to(self.device)
+        return s, a, r, ns, d, rl
 
     def __len__(self):
-        return len(self.buffer)
+        return len(self.states)
 
-# --------------------------------------------------------------------------------------
-# Networks: QNetwork (Double DQN) and RewardNet (self-rewarding)
-# 1D CNN across time with LeakyReLU; architecture aligned to paper guidance
-# --------------------------------------------------------------------------------------
-class QNetwork(nn.Module):
-    def __init__(self, in_channels: int, seq_len: int, num_actions: int):
+# ------------------------
+# Reward Network (SRDRL)
+# ------------------------
+class RewardNet(nn.Module):
+    """
+    A compact 1D CNN + MLP reward network that approximates action-wise rewards from a state sequence.
+    Outputs a 3-dim vector [r_hold, r_buy, r_sell].
+    """
+    def __init__(self, n_features: int, window: int, hidden: int = 64):
         super().__init__()
-        # Two Conv1D layers (120 channels each), LeakyReLU; then FCs
-        self.conv1 = nn.Conv1d(in_channels, 120, kernel_size=5, stride=1, padding=2)
-        self.conv2 = nn.Conv1d(120, 120, kernel_size=5, stride=1, padding=2)
-        self.act = nn.LeakyReLU(negative_slope=0.01)
-
-        # Compute flattened size
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, seq_len)
-            out = self.conv2(self.act(self.conv1(dummy)))
-            flatten_dim = out.numel()
-
-        self.fc1 = nn.Linear(flatten_dim, 120)
-        self.fc2 = nn.Linear(120, num_actions)  # Q-values for each action
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_channels=n_features, out_channels=32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(in_channels=32, out_channels=32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+        self.mlp = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 3)
+        )
 
     def forward(self, x):
-        # x: (batch, channels, seq_len)
-        x = self.act(self.conv1(x))
-        x = self.act(self.conv2(x))
-        x = torch.flatten(x, start_dim=1)
-        x = self.act(self.fc1(x))
-        q = self.fc2(x)
+        # x: [B, C, T]
+        h = self.conv(x)  # [B, 32, 1]
+        out = self.mlp(h)  # [B, 3]
+        return out
+
+# -------------------------
+# Q-Network (DDQN, simple)
+# -------------------------
+class QNetwork(nn.Module):
+    def __init__(self, n_features: int, window: int, hidden: int = 128, n_actions: int = 3):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(n_features, 64, kernel_size=5, padding=2),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.AdaptiveAvgPool1d(1)
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64, hidden),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden, n_actions)
+        )
+
+    def forward(self, x):
+        # x: [B, C, T]
+        h = self.conv(x)
+        q = self.fc(h)
         return q
 
-class RewardNet(nn.Module):
-    def __init__(self, in_channels: int, seq_len: int, num_actions: int):
-        super().__init__()
-        # RewardNet similar shape to QNetwork; GELU can be used as in SRDRL discussion
-        self.conv1 = nn.Conv1d(in_channels, 120, kernel_size=5, stride=1, padding=2)
-        self.conv2 = nn.Conv1d(120, 120, kernel_size=5, stride=1, padding=2)
-        self.act = nn.GELU()
+# -----------------
+# Trading Env
+# -----------------
+@dataclass
+class TradeEvent:
+    time: pd.Timestamp
+    action: str  # 'BUY' or 'SELL'
+    price: float
+    quantity: float
+    sell_win: Optional[bool] = None
 
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, seq_len)
-            out = self.conv2(self.act(self.conv1(dummy)))
-            flatten_dim = out.numel()
-
-        self.fc1 = nn.Linear(flatten_dim, 120)
-        self.fc2 = nn.Linear(120, num_actions)  # per-action reward prediction
-
-    def forward(self, x):
-        x = self.act(self.conv1(x))
-        x = self.act(self.conv2(x))
-        x = torch.flatten(x, start_dim=1)
-        x = self.act(self.fc1(x))
-        y = self.fc2(x)
-        return y
-
-# --------------------------------------------------------------------------------------
-# Environment: trading simulation for training reward shaping and evaluation
-# - State: window of normalized features
-# - Actions: 0 hold, 1 buy, 2 sell
-# - Expert reward: Sharpe (short-term), Return (instant), MinMax (short-term). We use Sharpe as the
-#   primary expert reward per Tran et al. (best) but also compute Return and MinMax to allow SRDRL selection.
-# --------------------------------------------------------------------------------------
 class TradingEnv:
+    """
+    Long-only environment with actions: 0 Hold, 1 Buy all, 2 Sell all.
+    Expert reward: short-term Sharpe ratio of forward returns (best per Tran et al. 2023).
+    Final reward used for agent: rt = max(expert_reward[action], reward_net_prediction[action]) per Huang et al. 2024.
+    """
     def __init__(
         self,
         prices: np.ndarray,
         features: np.ndarray,
-        config: Config,
-        episode_length: int,
-        start_index: int = 0,
-        eval_mode: bool = False
+        times: np.ndarray,
+        window_size: int = 60,
+        forward_horizon: int = 60,
+        init_capital: float = 100000.0,
+        fee_bps: float = 10.0  # 0.1% (10 basis points)
     ):
         self.prices = prices
         self.features = features
-        self.cfg = config
-        self.state_window = config.STATE_WINDOW
-        self.k = config.REWARD_WINDOW_K
-        self.eval_mode = eval_mode
+        self.times = times
+        self.window_size = window_size
+        self.forward_horizon = forward_horizon
+        self.init_capital = init_capital
+        self.fee_rate = fee_bps / 10000.0
 
-        # Trading state
-        self.cash = config.INITIAL_CASH
-        self.holdings = 0.0
-        self.position = 0  # 0 flat, +1 long
-        self.avg_buy_price = None
+        self.reset_indices(0, len(prices) - 1)  # default
+        self.reset()
 
-        # Episode indexing
-        self.t = 0
-        self.start_index = max(start_index, self.state_window)
-        self.end_index = min(len(prices) - 1, self.start_index + episode_length)
-        self.done = False
-
-        # Tracking
-        self.portfolio_values = []
-        self.cash_values = []
-        self.holdings_values = []
-        self.trade_log = []  # list of dict: time_idx, type, price, units, pnl, fee
+    def reset_indices(self, start_idx: int, end_idx: int):
+        self.start_idx = max(start_idx, 0)
+        self.end_idx = min(end_idx, len(self.prices) - 1)
 
     def reset(self):
-        self.cash = self.cfg.INITIAL_CASH
+        self.ptr = self.start_idx + self.window_size - 1
+        self.cash = self.init_capital
         self.holdings = 0.0
-        self.position = 0
-        self.avg_buy_price = None
-
-        self.t = 0
-        self.done = False
-
+        self.avg_cost = 0.0
         self.portfolio_values = []
-        self.cash_values = []
-        self.holdings_values = []
-        self.trade_log = []
-
+        self.cash_series = []
+        self.holdings_series = []
+        self.time_series = []
+        self.events: List[TradeEvent] = []
         return self._get_state()
 
-    def step(self, action: int):
+    def _get_state(self) -> torch.Tensor:
+        # Build state as [features] window: shape (C, T)
+        s_feat = self.features[self.ptr - self.window_size + 1 : self.ptr + 1]  # [T, C]
+        # Add position & cash normalized channels if desired
+        # We'll keep it simple and rely on technical indicators
+        s = torch.tensor(s_feat.T, dtype=torch.float32)
+        return s  # [C, T]
+
+    def _compute_expert_rewards(self) -> np.ndarray:
         """
-        Execute action: 0 hold, 1 buy, 2 sell
+        Compute expert reward per action using short-term Sharpe ratio of forward returns.
+        Actions: [Hold, Buy, Sell]
+        For long-only, we define:
+          r_hold = pos_sign * sharpe
+          r_buy  = +sharpe
+          r_sell = -sharpe (discourages selling into uptrend)
         """
-        idx = self.current_index()
-        price = float(self.prices[idx])
+        end = min(self.ptr + self.forward_horizon, self.end_idx)
+        base_price = self.prices[self.ptr]
+        if end <= self.ptr + 1:
+            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
-        # Trade execution (simplified; only long allowed)
-        fee = 0.0
-        pnl = 0.0
-        trade_type = None
+        forward_prices = self.prices[self.ptr+1 : end+1]
+        # Percent returns vs base
+        forward_returns = (forward_prices - base_price) / (base_price + 1e-12)
+        sr = sharpe_ratio(forward_returns)
+        pos_sign = 1.0 if self.holdings > 0 else 0.0
+        r_hold = pos_sign * sr
+        r_buy = sr
+        r_sell = -sr
+        return np.array([r_hold, r_buy, r_sell], dtype=np.float32)
 
-        if action == 1:  # buy
-            if self.position == 0 and self.cash > 0:
-                # invest fraction of cash
-                buy_cash = self.cash * self.cfg.TRADE_FRACTION
-                fee = buy_cash * self.cfg.FEE_RATE
-                buy_cash_after_fee = buy_cash - fee
-                units = buy_cash_after_fee / price
-                self.holdings += units
-                self.cash -= buy_cash
-                self.position = 1
-                self.avg_buy_price = price
-                trade_type = 'buy'
-                self.trade_log.append({
-                    "time_idx": idx, "type": trade_type, "price": price,
-                    "units": units, "pnl": 0.0, "fee": fee
-                })
+    def _update_portfolio_series(self):
+        pv = self.cash + self.holdings * self.prices[self.ptr]
+        self.portfolio_values.append(pv)
+        self.cash_series.append(self.cash)
+        self.holdings_series.append(self.holdings)
+        self.time_series.append(self.times[self.ptr])
 
-        elif action == 2:  # sell (close long)
-            if self.position == 1 and self.holdings > 0:
-                sell_value = self.holdings * price
-                fee = sell_value * self.cfg.FEE_RATE
-                receive = sell_value - fee
-                pnl = (price - self.avg_buy_price) * self.holdings - fee
-                self.cash += receive
-                self.position = 0
-                # classify win vs loss
-                trade_type = 'sell_win' if (price - self.avg_buy_price) > 0 else 'sell_loss'
-                self.trade_log.append({
-                    "time_idx": idx, "type": trade_type, "price": price,
-                    "units": self.holdings, "pnl": pnl, "fee": fee
-                })
+    def step(self, action: int, reward_net: Optional[nn.Module] = None, device: Optional[torch.device] = None):
+        price = self.prices[self.ptr]
+        # Predicted rewards from RewardNet
+        state = self._get_state().unsqueeze(0)  # [1, C, T]
+        rst = None
+        if reward_net is not None:
+            reward_net.eval()
+            with torch.no_grad():
+                rst_t = reward_net(state.to(device))  # [1, 3]
+                rst = rst_t.squeeze(0).cpu().numpy()
+        else:
+            rst = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        # Expert rewards per action
+        ret = self._compute_expert_rewards()
+
+        # Final reward vector: element-wise choose better for each action
+        r_vec = np.where(rst >= ret, rst, ret)  # [3]
+
+        # Execute action
+        trade_event = None
+        if action == 1:  # Buy all if flat
+            if self.holdings == 0.0 and self.cash > 0.0:
+                qty = (self.cash * (1.0 - self.fee_rate)) / price
+                if qty > 0:
+                    cost = qty * price
+                    fee = cost * self.fee_rate
+                    self.cash -= (cost + fee)
+                    self.holdings += qty
+                    self.avg_cost = price
+                    trade_event = TradeEvent(time=self.times[self.ptr], action="BUY", price=price, quantity=qty)
+        elif action == 2:  # Sell all if long
+            if self.holdings > 0.0:
+                proceeds = self.holdings * price
+                fee = proceeds * self.fee_rate
+                self.cash += (proceeds - fee)
+                sell_win = price >= self.avg_cost
+                trade_event = TradeEvent(time=self.times[self.ptr], action="SELL", price=price, quantity=self.holdings, sell_win=sell_win)
                 self.holdings = 0.0
-                self.avg_buy_price = None
+                self.avg_cost = 0.0
+        # Hold: do nothing
 
-        # Update portfolio tracking
-        port_val = self.cash + self.holdings * price
-        self.portfolio_values.append(port_val)
-        self.cash_values.append(self.cash)
-        self.holdings_values.append(self.holdings)
+        # Update series
+        self._update_portfolio_series()
 
-        # Advance time
-        self.t += 1
-        if self.current_index() >= self.end_index - 1:
-            self.done = True
+        # Move pointer
+        done = False
+        if self.ptr >= self.end_idx - 1:
+            done = True
+        else:
+            self.ptr += 1
 
         next_state = self._get_state()
+        # Reward scalar is the chosen action's element
+        reward_scalar = float(r_vec[action])
 
-        # Reward shaping (expert + self-reward)
-        expert_rewards = self._compute_expert_rewards()
-        return next_state, expert_rewards, self.done
+        # Return reward label vector (for training reward net)
+        r_label_vec = torch.tensor(r_vec, dtype=torch.float32)
 
-    def _get_state(self):
-        idx = self.current_index()
-        seq = self.features[idx - self.state_window + 1: idx + 1]  # shape (state_window, n_features)
-        # Convert to (channels, seq_len)
-        seq = np.transpose(seq, (1, 0))  # (n_features, state_window)
-        return seq.astype(np.float32)
-
-    def current_index(self):
-        return self.start_index + self.t
-
-    def _future_returns(self, idx, k):
-        p0 = float(self.prices[idx])
-        # future idx sequence
-        right = min(idx + k, len(self.prices) - 1)
-        future_slice = self.prices[idx+1: right+1]
-        if len(future_slice) == 0:
-            return np.array([0.0], dtype=np.float32)
-        rets = (future_slice - p0) / p0
-        return rets.astype(np.float32)
-
-    def _compute_expert_rewards(self):
-        """
-        Compute expert rewards for actions: hold(POSt=0), buy(POSt=+1), sell(POSt=-1).
-        Expert includes: Sharpe (short-term window k), Return (instant), MinMax (window k).
-        We select Sharpe as the main expert signal per Tran et al. (best), but we also carry
-        Return and MinMax to allow per-action max selection with RewardNet outputs.
-        Returns vector [r_hold, r_buy, r_sell] from expert design.
-        """
-        idx = self.current_index()
-        k = self.k
-
-        # POSt for each action [hold, buy, sell]
-        pos_actions = np.array([0, 1, -1], dtype=np.float32)
-
-        # Short-term vector returns starting at idx
-        Rk = self._future_returns(idx, k)
-        mean_r = float(np.mean(Rk)) if len(Rk) > 0 else 0.0
-        std_r = float(np.std(Rk)) if len(Rk) > 1 else 0.0
-        sharpe_term = (mean_r / std_r) if std_r > 1e-12 else 0.0
-
-        # Return-based reward (instant)
-        if idx > 0:
-            r_inst = (float(self.prices[idx]) - float(self.prices[idx-1])) / float(self.prices[idx-1])
-        else:
-            r_inst = 0.0
-
-        # MinMax-based reward (window k)
-        if len(Rk) > 0:
-            maxR = float(np.max(np.where(Rk > 0, Rk, 0.0)))
-            minR = float(np.min(np.where(Rk < 0, Rk, 0.0)))
-            # Following the described logic:
-            if (maxR > 0) or (maxR + minR > 0):
-                minmax_term = maxR
-            elif (minR < 0) or (maxR + minR < 0):
-                minmax_term = minR
-            else:
-                minmax_term = (maxR - minR)  # fallback
-        else:
-            minmax_term = 0.0
-
-        # Expert-labeled rewards per action:
-        r_sharpe = pos_actions * sharpe_term
-        r_return = pos_actions * r_inst
-        r_minmax = pos_actions * minmax_term
-
-        # Combine to a single expert vector; per Tran et al. the best is Sharpe.
-        # For SRDRL we will compare RewardNet predictions against each expert metric and take the max per action.
-        # Here we choose Sharpe as "expert baseline" but return all three as a stacked for convenience.
-        # We'll compute per-action expert "ret" as Sharpe, and also keep Return/MinMax available for the max.
-        expert = {
-            "sharpe": r_sharpe.astype(np.float32),
-            "return": r_return.astype(np.float32),
-            "minmax": r_minmax.astype(np.float32),
+        info = {
+            "rst": rst,
+            "ret": ret,
+            "r_vec": r_vec,
+            "trade_event": trade_event
         }
-        return expert
+        return next_state, reward_scalar, done, info
 
-# --------------------------------------------------------------------------------------
-# Epsilon scheduler (linear decay)
-# --------------------------------------------------------------------------------------
-class EpsilonScheduler:
-    def __init__(self, start=1.0, end=0.12, decay_steps=300):
-        self.start = start
-        self.end = end
-        self.decay_steps = decay_steps
-        self.step_count = 0
+# ----------------------------
+# Walk-forward preparation
+# ----------------------------
+def split_walk_forward(df: pd.DataFrame, period_days: int = 36, train_ratio: float = 0.8) -> List[Tuple[int, int, int, int]]:
+    """
+    Returns list of tuples: (train_start_idx, train_end_idx, test_start_idx, test_end_idx)
+    """
+    minutes_per_day = 1440
+    period_len = period_days * minutes_per_day
+    n = len(df)
+    windows = []
+    start = 0
+    while start + period_len <= n:
+        end = start + period_len
+        train_end = start + int(period_len * train_ratio)
+        windows.append((start, train_end, train_end, end))
+        start = end  # non-overlapping walk-forward
+    return windows
 
-    def step(self):
-        self.step_count += 1
+def standardize_features(train_feat: np.ndarray, test_feat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    scaler = StandardScaler()
+    scaler.fit(train_feat)
+    train_scaled = scaler.transform(train_feat)
+    test_scaled = scaler.transform(test_feat)
+    return train_scaled, test_scaled
 
-    def value(self):
-        frac = min(1.0, self.step_count / float(self.decay_steps))
-        return self.start + (self.end - self.start) * frac
+# ----------------------------
+# Training & Evaluation (DDQN)
+# ----------------------------
+def train_srddqn_on_window(
+    df: pd.DataFrame,
+    window: Tuple[int, int, int, int],
+    feature_cols: List[str],
+    device: torch.device,
+    ddqn_params: Dict,
+    reward_net_params: Dict,
+    verbose: bool = False
+):
+    (train_start, train_end, test_start, test_end) = window
+    sub_train = df.iloc[train_start:train_end].copy()
+    sub_test = df.iloc[test_start:test_end].copy()
 
-# --------------------------------------------------------------------------------------
-# Metrics
-# --------------------------------------------------------------------------------------
-def compute_performance_metrics(times, prices, portfolio_values):
-    # Compute returns series from portfolio values
-    pv = np.array(portfolio_values, dtype=np.float64)
-    rets = np.diff(pv) / pv[:-1]
-    rets = np.nan_to_num(rets, nan=0.0)
+    # Build feature matrices and standardize by train statistics
+    train_feat_mat = sub_train[feature_cols].values
+    test_feat_mat = sub_test[feature_cols].values
+    train_feat_mat, test_feat_mat = standardize_features(train_feat_mat, test_feat_mat)
 
-    # Cumulative return (%)
-    cr = (pv[-1] / pv[0] - 1.0) * 100.0
+    # Prepare env & networks
+    window_size = ddqn_params["window_size"]
+    forward_horizon = ddqn_params["forward_horizon"]
+    init_capital = ddqn_params["init_capital"]
+    fee_bps = ddqn_params["fee_bps"]
 
-    # Annualized return based on minute returns
-    mean_r = np.mean(rets)
-    std_r = np.std(rets)
-    # Annualize
-    ar = (1.0 + mean_r) ** Config.MINUTES_PER_YEAR - 1.0
-    ar *= 100.0
-
-    # Sharpe ratio
-    sr = (mean_r / std_r) * math.sqrt(Config.MINUTES_PER_YEAR) if std_r > 1e-12 else 0.0
-
-    # Max drawdown
-    peak = np.maximum.accumulate(pv)
-    drawdown = (pv - peak) / peak
-    mdd = -np.min(drawdown) * 100.0
-
-    # Volatility
-    vol = std_r * math.sqrt(Config.MINUTES_PER_YEAR) * 100.0
-
-    return {
-        "CR_%": cr,
-        "AR_%": ar,
-        "SR": sr,
-        "MDD_%": mdd,
-        "Vol_%": vol,
-    }
-
-def trade_statistics(trade_log):
-    sells = [t for t in trade_log if t["type"].startswith("sell")]
-    wins = [t for t in sells if t["type"] == "sell_win"]
-    losses = [t for t in sells if t["type"] == "sell_loss"]
-    n_trades = len(sells)
-    win_rate = (len(wins) / n_trades * 100.0) if n_trades > 0 else 0.0
-    avg_pnl = np.mean([t["pnl"] for t in sells]) if n_trades > 0 else 0.0
-    return {
-        "n_trades": n_trades,
-        "win_rate_%": win_rate,
-        "avg_trade_pnl": avg_pnl,
-    }
-
-# --------------------------------------------------------------------------------------
-# Training (SRDDQN): Double DQN + RewardNet with self-rewarding mechanism
-# --------------------------------------------------------------------------------------
-def train_agent(train_prices, train_features):
-    cfg = Config()
-
-    torch.manual_seed(cfg.RANDOM_SEED)
-    np.random.seed(cfg.RANDOM_SEED)
-
-    # Initialize networks and optimizers
-    in_channels = train_features.shape[1]
-    seq_len = cfg.STATE_WINDOW
-    num_actions = cfg.NUM_ACTIONS
-
-    q_net = QNetwork(in_channels, seq_len, num_actions).to(cfg.DEVICE)
-    target_net = QNetwork(in_channels, seq_len, num_actions).to(cfg.DEVICE)
-    target_net.load_state_dict(q_net.state_dict())
-    target_net.eval()
-
-    reward_net = RewardNet(in_channels, seq_len, num_actions).to(cfg.DEVICE)
-
-    opt_q = torch.optim.Adam(q_net.parameters(), lr=cfg.LR_Q)
-    opt_r = torch.optim.Adam(reward_net.parameters(), lr=cfg.LR_REWARD)
-
-    buffer = ReplayBuffer(cfg.REPLAY_SIZE)
-    eps_sched = EpsilonScheduler(start=cfg.EPS_START, end=cfg.EPS_END, decay_steps=cfg.EPS_DECAY_STEPS)
-
-    # Training episodes
-    steps_since_target_update = 0
-    losses_q = []
-    losses_r = []
-
-    episode_length = min(3000, len(train_prices) - cfg.STATE_WINDOW - 2)  # reasonable length for learning
-    start_indices = np.linspace(cfg.STATE_WINDOW, len(train_prices) - episode_length - 2, num=cfg.EPISODES).astype(int)
-
-    pbar = trange(cfg.EPISODES, desc="Training Episodes", leave=True)
-    for ep_idx in pbar:
-        env = TradingEnv(
-            prices=train_prices,
-            features=train_features,
-            config=cfg,
-            episode_length=episode_length,
-            start_index=int(start_indices[ep_idx])
-        )
-        state = env.reset()
-
-        ep_step_bar = trange(episode_length, desc=f"Episode {ep_idx+1}/{cfg.EPISODES}", leave=False)
-        for _ in ep_step_bar:
-            # epsilon-greedy
-            eps = eps_sched.value()
-            eps_sched.step()
-
-            # Prepare state tensor
-            s_t = torch.tensor(state, dtype=torch.float32, device=cfg.DEVICE).unsqueeze(0)  # (1, C, T)
-
-            if np.random.rand() < eps:
-                action = np.random.randint(0, num_actions)
-            else:
-                with torch.no_grad():
-                    q_vals = q_net(s_t)
-                    action = int(torch.argmax(q_vals, dim=1).item())
-
-            next_state, expert_rewards_dict, done = env.step(action)
-
-            # Expert reward per action: use Sharpe (best) but enable SRDRL (compare predicted vs expert)
-            r_exp_sharpe = expert_rewards_dict["sharpe"]  # vector of length 3
-            r_exp_return = expert_rewards_dict["return"]
-            r_exp_minmax = expert_rewards_dict["minmax"]
-
-            # Build a per-action expert vector by combining Sharpe + (optionally Return/MinMax)
-            # We'll take the maximum across expert metrics (Sharpe, Return, MinMax) per action to be robust
-            ret_vec_expert = np.stack([r_exp_sharpe, r_exp_return, r_exp_minmax], axis=0)  # shape (3, 3)
-            # max across metrics dimension
-            ret_vec_expert = np.max(ret_vec_expert, axis=0).astype(np.float32)  # shape (3,)
-
-            # Self-reward predicted by reward_net
-            s_t_reward = torch.tensor(state, dtype=torch.float32, device=cfg.DEVICE).unsqueeze(0)
-            with torch.no_grad():
-                r_pred = reward_net(s_t_reward).squeeze(0)  # (3,)
-            r_pred_np = r_pred.detach().cpu().numpy().astype(np.float32)
-
-            # SRDRL: Select higher elements between predicted and expert per action (vector)
-            rlt_vec = np.where(r_pred_np >= ret_vec_expert, r_pred_np, ret_vec_expert).astype(np.float32)
-            # Scalar reward to agent is that selected for the action taken
-            reward = float(rlt_vec[action])
-
-            buffer.push(state, action, reward, next_state, done, rlt_vec)
-
-            # Update state
-            state = next_state
-
-            # Optimize networks if buffer large enough
-            if len(buffer) >= cfg.BATCH_SIZE:
-                batch = buffer.sample(cfg.BATCH_SIZE)
-                b_states, b_actions, b_rewards, b_next_states, b_dones, b_rlt_vecs = batch
-
-                b_states = b_states.to(cfg.DEVICE)  # (B, C, T)
-                b_next_states = b_next_states.to(cfg.DEVICE)
-                b_actions = b_actions.to(cfg.DEVICE)
-                b_rewards = b_rewards.to(cfg.DEVICE)
-                b_dones = b_dones.to(cfg.DEVICE)
-                b_rlt_vecs = b_rlt_vecs.to(cfg.DEVICE)
-
-                # Q-network update (Double DQN target)
-                q_pred = q_net(b_states)  # (B, A)
-                q_pred_a = q_pred.gather(1, b_actions.unsqueeze(1)).squeeze(1)  # (B,)
-
-                with torch.no_grad():
-                    next_q_main = q_net(b_next_states)  # (B, A)
-                    next_actions = torch.argmax(next_q_main, dim=1)  # (B,)
-                    next_q_target = target_net(b_next_states)  # (B, A)
-                    next_q_target_a = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)  # (B,)
-                    td_target = b_rewards + cfg.GAMMA * (1.0 - b_dones) * next_q_target_a  # (B,)
-
-                loss_q = F.mse_loss(q_pred_a, td_target)
-                opt_q.zero_grad()
-                loss_q.backward()
-                opt_q.step()
-
-                losses_q.append(float(loss_q.item()))
-                steps_since_target_update += 1
-
-                # RewardNet supervised update to predict rlt_vecs
-                r_pred_batch = reward_net(b_states)  # (B, A)
-                loss_r = F.mse_loss(r_pred_batch, b_rlt_vecs)
-                opt_r.zero_grad()
-                loss_r.backward()
-                opt_r.step()
-                losses_r.append(float(loss_r.item()))
-
-                # Target network periodic update
-                if steps_since_target_update >= cfg.TARGET_UPDATE_EVERY:
-                    target_net.load_state_dict(q_net.state_dict())
-                    steps_since_target_update = 0
-
-            if done:
-                break
-
-        # Update episode progress bar postfix
-        if len(losses_q) > 0 and len(losses_r) > 0:
-            pbar.set_postfix({
-                "loss_q": f"{np.mean(losses_q[-50:]):.4f}",
-                "loss_r": f"{np.mean(losses_r[-50:]):.4f}",
-                "eps": f"{eps:.3f}",
-            })
-
-    return q_net, reward_net
-
-# --------------------------------------------------------------------------------------
-# Evaluation: forward-moving across the test set, greedy policy (epsilon=0)
-# --------------------------------------------------------------------------------------
-def evaluate_agent(test_df, scaler, feature_cols, q_net):
-    cfg = Config()
-
-    test_prices = test_df["Close"].values.astype(np.float32)
-    test_features = transform_features(test_df, scaler, feature_cols).astype(np.float32)
-
-    env = TradingEnv(
-        prices=test_prices,
-        features=test_features,
-        config=cfg,
-        episode_length=len(test_prices) - cfg.STATE_WINDOW - 2,
-        start_index=cfg.STATE_WINDOW,
-        eval_mode=True
+    env_train = TradingEnv(
+        prices=sub_train["Close"].values,
+        features=train_feat_mat,
+        times=sub_train.index.values,
+        window_size=window_size,
+        forward_horizon=forward_horizon,
+        init_capital=init_capital,
+        fee_bps=fee_bps
     )
-    state = env.reset()
+    env_train.reset_indices(0, len(sub_train["Close"].values) - 1)
+    env_train.reset()
 
-    # Greedy action selection
-    eval_steps = env.end_index - env.start_index
-    eval_bar = trange(eval_steps, desc="Evaluating (forward-moving)", leave=True)
-    for _ in eval_bar:
-        s_t = torch.tensor(state, dtype=torch.float32, device=cfg.DEVICE).unsqueeze(0)
-        with torch.no_grad():
-            q_vals = q_net(s_t)
+    env_test = TradingEnv(
+        prices=sub_test["Close"].values,
+        features=test_feat_mat,
+        times=sub_test.index.values,
+        window_size=window_size,
+        forward_horizon=forward_horizon,
+        init_capital=init_capital,
+        fee_bps=fee_bps
+    )
+    env_test.reset_indices(0, len(sub_test["Close"].values) - 1)
+    env_test.reset()
+
+    n_features = train_feat_mat.shape[1]
+    q_online = QNetwork(n_features=n_features, window=window_size, hidden=ddqn_params["hidden"], n_actions=3).to(device)
+    q_target = QNetwork(n_features=n_features, window=window_size, hidden=ddqn_params["hidden"], n_actions=3).to(device)
+    q_target.load_state_dict(q_online.state_dict())
+
+    reward_net = RewardNet(n_features=n_features, window=window_size, hidden=reward_net_params["hidden"]).to(device)
+
+    q_opt = optim.Adam(q_online.parameters(), lr=ddqn_params["lr"])
+    r_opt = optim.Adam(reward_net.parameters(), lr=reward_net_params["lr"])
+    mse = nn.MSELoss()
+
+    buffer = ReplayBuffer(capacity=ddqn_params["buffer_capacity"], state_shape=(n_features, window_size), device=device)
+
+    episodes = ddqn_params["episodes"]
+    batch_size = ddqn_params["batch_size"]
+    gamma = ddqn_params["gamma"]
+    target_update_step = ddqn_params["target_update_step"]
+
+    epsilon_start = ddqn_params["epsilon_start"]
+    epsilon_end = ddqn_params["epsilon_end"]
+    epsilon_decay_steps = ddqn_params["epsilon_decay_steps"]
+
+    global_step = 0
+    ep_bar = tqdm(range(episodes), desc="Train episodes", disable=not verbose)
+    for ep in ep_bar:
+        state = env_train.reset()
+        done = False
+        ep_steps = 0
+        price_series_len = len(env_train.prices)
+        step_bar = tqdm(total=(price_series_len - env_train.window_size), desc=f"Episode {ep+1}", leave=False, disable=not verbose)
+        while not done:
+            # epsilon-greedy
+            eps = epsilon_end + (epsilon_start - epsilon_end) * math.exp(-1.0 * global_step / max(1, epsilon_decay_steps))
+            q_online.eval()
+            with torch.no_grad():
+                q_vals = q_online(state.unsqueeze(0).to(device))  # [1, 3]
+            if np.random.rand() < eps:
+                action = np.random.randint(0, 3)
+            else:
+                action = int(torch.argmax(q_vals, dim=1).item())
+
+            next_state, reward_scalar, done, info = env_train.step(action, reward_net=reward_net, device=device)
+
+            # Push to buffer
+            buffer.push(state, action, reward_scalar, next_state, done, torch.tensor(info["r_vec"], dtype=torch.float32))
+
+            state = next_state
+            ep_steps += 1
+            global_step += 1
+            step_bar.update(1)
+
+            # Train both networks if enough samples
+            if len(buffer) >= batch_size:
+                s, a, r, ns, d, rl = buffer.sample(batch_size)
+
+                # Q update (Double DQN)
+                q_online.train()
+                q_target.eval()
+                with torch.no_grad():
+                    # online selects action
+                    next_q_online = q_online(ns)
+                    next_actions = torch.argmax(next_q_online, dim=1)  # [B]
+                    # target evaluates
+                    next_q_target = q_target(ns)
+                    target_q = next_q_target.gather(1, next_actions.view(-1, 1)).squeeze(1)
+                    y = r + (~d).float() * gamma * target_q
+                q_pred = q_online(s).gather(1, a.view(-1, 1)).squeeze(1)
+                q_loss = mse(q_pred, y)
+                q_opt.zero_grad()
+                q_loss.backward()
+                q_opt.step()
+
+                # RewardNet update (synchronous, shared buffer)
+                reward_net.train()
+                r_pred = reward_net(s)  # [B, 3]
+                r_loss = mse(r_pred, rl)
+                r_opt.zero_grad()
+                r_loss.backward()
+                r_opt.step()
+
+                if global_step % target_update_step == 0:
+                    q_target.load_state_dict(q_online.state_dict())
+
+        step_bar.close()
+
+    # ----------------------
+    # Evaluation on test set
+    # ----------------------
+    q_online.eval()
+    reward_net.eval()
+
+    state = env_test.reset()
+    done = False
+    test_returns = []
+    # For plotting trade markers
+    buy_markers = []
+    sell_win_markers = []
+    sell_lose_markers = []
+
+    with tqdm(total=(len(env_test.prices) - env_test.window_size), desc="Evaluate", disable=not verbose) as eval_bar:
+        prev_pv = env_test.cash + env_test.holdings * env_test.prices[env_test.ptr]
+        while not done:
+            with torch.no_grad():
+                q_vals = q_online(state.unsqueeze(0).to(device))
             action = int(torch.argmax(q_vals, dim=1).item())
+            next_state, reward_scalar, done, info = env_test.step(action, reward_net=reward_net, device=device)
+            # Compute minute return of portfolio
+            pv = env_test.cash + env_test.holdings * env_test.prices[env_test.ptr]
+            ret = (pv - prev_pv) / (prev_pv + 1e-12)
+            test_returns.append(ret)
+            prev_pv = pv
 
-        next_state, _, done = env.step(action)
-        state = next_state
-        if done:
-            break
+            # Collect trade markers
+            evt = info.get("trade_event", None)
+            if evt is not None:
+                ts = evt.time
+                if evt.action == "BUY":
+                    buy_markers.append((ts, evt.price))
+                elif evt.action == "SELL":
+                    if evt.sell_win:
+                        sell_win_markers.append((ts, evt.price))
+                    else:
+                        sell_lose_markers.append((ts, evt.price))
 
-    # Gather evaluation series
-    times = test_df.index[env.start_index:env.start_index + len(env.portfolio_values)]
-    prices_segment = test_df["Close"].iloc[env.start_index:env.start_index + len(env.portfolio_values)].values
+            state = next_state
+            eval_bar.update(1)
 
-    metrics = compute_performance_metrics(times, prices_segment, env.portfolio_values)
-    stats = trade_statistics(env.trade_log)
-    return env, times, metrics, stats
+    pv_series = np.array(env_test.portfolio_values)
+    cash_series = np.array(env_test.cash_series)
+    holdings_series = np.array(env_test.holdings_series)
+    time_series = np.array(env_test.time_series)
+    price_series = env_test.prices[env_test.ptr - len(pv_series) + 1 : env_test.ptr + 1]
+    # Align price_series length with time_series
+    if len(price_series) != len(time_series):
+        price_series = env_test.prices[(env_test.ptr - len(time_series) + 1) : env_test.ptr + 1]
 
-# --------------------------------------------------------------------------------------
-# Plotting: single window with 4 separated figures (subplots)
-# --------------------------------------------------------------------------------------
-def plot_results(times, prices, env):
-    # times: datetime index
-    # env: TradingEnv after evaluation
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                        subplot_titles=("BTC-USD Close (with trades)",
-                                        "Portfolio Value",
-                                        "Credit (Cash) Value",
-                                        "Holdings (BTC units)"))
+    # Metrics
+    cum_ret = (pv_series[-1] / pv_series[0]) - 1.0 if len(pv_series) > 1 else 0.0
+    sr = sharpe_ratio(np.array(test_returns))
+    mdd = max_drawdown(pv_series)
+    num_trades = len(buy_markers) + len(sell_win_markers) + len(sell_lose_markers)
+    wins = len(sell_win_markers)
+    loses = len(sell_lose_markers)
+    win_rate = wins / max(1, (wins + loses))
 
-    # 1) Price
-    fig.add_trace(go.Scatter(x=times, y=prices, name="Close", line=dict(color="blue")), row=1, col=1)
+    metrics = {
+        "cumulative_return": cum_ret,
+        "sharpe_ratio": sr,
+        "max_drawdown": mdd,
+        "num_trades": num_trades,
+        "win_rate": win_rate,
+        "wins": wins,
+        "loses": loses
+    }
 
-    # Buy markers
-    buys = [t for t in env.trade_log if t["type"] == "buy"]
-    if len(buys) > 0:
+    plotting_payload = {
+        "time": time_series,
+        "price": price_series,
+        "portfolio": pv_series,
+        "cash": cash_series,
+        "holdings": holdings_series,
+        "buy_markers": buy_markers,
+        "sell_win_markers": sell_win_markers,
+        "sell_lose_markers": sell_lose_markers,
+        "window": window
+    }
+    return metrics, plotting_payload
+
+def plot_results(payload, title_suffix=""):
+    time = payload["time"]
+    price = payload["price"]
+    portfolio = payload["portfolio"]
+    cash = payload["cash"]
+    holdings = payload["holdings"]
+    buy_markers = payload["buy_markers"]
+    sell_win_markers = payload["sell_win_markers"]
+    sell_lose_markers = payload["sell_lose_markers"]
+
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True,
+        subplot_titles=("BTC Price with Trades", "Portfolio Value", "Credit (Cash)", "Holdings (BTC)"),
+        vertical_spacing=0.06
+    )
+
+    # Price subplot with markers
+    fig.add_trace(go.Scatter(x=time, y=price, name="BTC-USD Price", mode="lines", line=dict(color="royalblue")), row=1, col=1)
+
+    if len(buy_markers) > 0:
+        bm_t = [t for t, p in buy_markers]
+        bm_p = [p for t, p in buy_markers]
         fig.add_trace(go.Scatter(
-            x=[times.iloc[np.where(times == times[t["time_idx"]])[0][0]] if times[0] != times[t["time_idx"]] else times[0] for t in buys] if False else
-            [times[t["time_idx"] - env.start_index] for t in buys],
-            y=[t["price"] for t in buys],
-            mode="markers",
-            name="Buy",
-            marker=dict(color="green", symbol="triangle-up", size=10)
+            x=bm_t, y=bm_p, name="BUY", mode="markers",
+            marker=dict(symbol="triangle-up", color="green", size=8)
         ), row=1, col=1)
 
-    # Sell-win markers
-    sell_wins = [t for t in env.trade_log if t["type"] == "sell_win"]
-    if len(sell_wins) > 0:
+    if len(sell_win_markers) > 0:
+        sw_t = [t for t, p in sell_win_markers]
+        sw_p = [p for t, p in sell_win_markers]
         fig.add_trace(go.Scatter(
-            x=[times[t["time_idx"] - env.start_index] for t in sell_wins],
-            y=[t["price"] for t in sell_wins],
-            mode="markers",
-            name="Sell (Win)",
-            marker=dict(color="orange", symbol="circle", size=9)
+            x=sw_t, y=sw_p, name="SELL-WIN", mode="markers",
+            marker=dict(symbol="circle", color="limegreen", size=8)
         ), row=1, col=1)
 
-    # Sell-loss markers
-    sell_losses = [t for t in env.trade_log if t["type"] == "sell_loss"]
-    if len(sell_losses) > 0:
+    if len(sell_lose_markers) > 0:
+        sl_t = [t for t, p in sell_lose_markers]
+        sl_p = [p for t, p in sell_lose_markers]
         fig.add_trace(go.Scatter(
-            x=[times[t["time_idx"] - env.start_index] for t in sell_losses],
-            y=[t["price"] for t in sell_losses],
-            mode="markers",
-            name="Sell (Loss)",
-            marker=dict(color="red", symbol="x", size=9)
+            x=sl_t, y=sl_p, name="SELL-LOSE", mode="markers",
+            marker=dict(symbol="circle", color="red", size=8)
         ), row=1, col=1)
 
-    # 2) Portfolio value
-    fig.add_trace(go.Scatter(
-        x=times, y=env.portfolio_values, name="Portfolio", line=dict(color="purple")
-    ), row=2, col=1)
+    # Portfolio subplot
+    fig.add_trace(go.Scatter(x=time, y=portfolio, name="Portfolio Value", mode="lines", line=dict(color="darkorange")), row=2, col=1)
 
-    # 3) Credit (Cash)
-    fig.add_trace(go.Scatter(
-        x=times, y=env.cash_values, name="Cash", line=dict(color="brown")
-    ), row=3, col=1)
+    # Cash subplot
+    fig.add_trace(go.Scatter(x=time, y=cash, name="Cash", mode="lines", line=dict(color="purple")), row=3, col=1)
 
-    # 4) Holdings
-    fig.add_trace(go.Scatter(
-        x=times, y=env.holdings_values, name="Holdings (BTC)", line=dict(color="black")
-    ), row=4, col=1)
+    # Holdings subplot
+    fig.add_trace(go.Scatter(x=time, y=holdings, name="Holdings (BTC)", mode="lines", line=dict(color="teal")), row=4, col=1)
 
-    fig.update_layout(height=1000, title="DRL BTC-USD Trading (DDQN + Self-Rewarding) — Walk-Forward Evaluation")
+    fig.update_layout(
+        title=f"Walk-Forward Test Results {title_suffix}",
+        height=900,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
     fig.show()
 
-# --------------------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------------------
 def main():
-    print(f"Running on device: {Config.DEVICE.type}")
-    print("Dependencies OK. Loading data...")
+    # Device selection (mps if possible, else cuda, else cpu)
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
 
+    print("Loading data...")
     df = load_data()
-    print(f"Loaded {len(df):,} rows from {df.index.min()} to {df.index.max()}")
+    # Compute indicators
+    df = add_indicators(df)
 
-    df = compute_features(df)
-    train_df, test_df = split_train_test(df, test_ratio=Config.TEST_SPLIT)
+    # Feature columns used for state (ta indicators and returns)
+    feature_cols = [
+        "ret1", "logret1", "rsi", "macd", "macd_signal", "macd_hist",
+        "ema_12", "ema_26", "atr", "mfi"
+    ]
 
-    print(f"Train rows: {len(train_df):,} | Test rows: {len(test_df):,}")
+    # Ensure data clean
+    df = df.dropna()
+    print(f"Data samples: {len(df)}; date range: {df.index.min()} -> {df.index.max()}")
 
-    feature_cols = Config.FEATURES
-    scaler = prepare_scalers(train_df, feature_cols)
-    train_features = transform_features(train_df, scaler, feature_cols).astype(np.float32)
-    test_features = transform_features(test_df, scaler, feature_cols).astype(np.float32)
+    # Walk-forward windows: 36 days per paper (Tran et al.), 80/20 split
+    windows = split_walk_forward(df, period_days=36, train_ratio=0.8)
+    if len(windows) == 0:
+        # Fallback to a single split (80/20)
+        n = len(df)
+        train_end = int(n * 0.8)
+        windows = [(0, train_end, train_end, n)]
+    print(f"Walk-forward windows: {len(windows)}")
 
-    train_prices = train_df["Close"].values.astype(np.float32)
-    test_prices = test_df["Close"].values.astype(np.float32)
+    # Hyperparameters (inspired by both papers)
+    ddqn_params = {
+        "window_size": 60,            # 60 minutes history in state
+        "forward_horizon": 60,        # short-term forward horizon for Sharpe reward (60 minutes)
+        "init_capital": 100000.0,
+        "fee_bps": 10.0,              # 0.1% per transaction
+        "hidden": 128,
+        "lr": 1e-3,
+        "buffer_capacity": 10000,
+        "episodes": 10,               # adjust higher for longer training (paper used ~100)
+        "batch_size": 64,
+        "gamma": 0.98,                # as per paper (future rewards matter)
+        "target_update_step": 100,
+        "epsilon_start": 1.0,
+        "epsilon_end": 0.10,
+        "epsilon_decay_steps": 3000
+    }
+    reward_net_params = {
+        "hidden": 64,
+        "lr": 1e-3
+    }
 
-    # Train agent
-    print("Training agent (DDQN + Self-Rewarding RewardNet)...")
-    q_net, reward_net = train_agent(train_prices, train_features)
+    all_metrics = []
+    last_payload = None
 
-    # Evaluate agent forward-moving on test set
-    print("Evaluating agent (walk-forward on test set)...")
-    env, times, metrics, stats = evaluate_agent(test_df, scaler, feature_cols, q_net)
+    wf_bar = tqdm(windows, desc="Walk-forward windows")
+    for i, w in enumerate(wf_bar):
+        metrics, payload = train_srddqn_on_window(
+            df=df,
+            window=w,
+            feature_cols=feature_cols,
+            device=device,
+            ddqn_params=ddqn_params,
+            reward_net_params=reward_net_params,
+            verbose=True
+        )
+        all_metrics.append(metrics)
+        last_payload = payload
 
-    # Print metrics
-    print("\nEvaluation Metrics (Forward-Moving on Test):")
-    for k, v in metrics.items():
-        print(f"  {k}: {v:.4f}")
+        # Print per-window metrics
+        train_start, train_end, test_start, test_end = w
+        print("\n========== Walk-forward Window Results ==========")
+        print(f"Train: {df.index[train_start]} -> {df.index[train_end-1]} | Test: {df.index[test_start]} -> {df.index[test_end-1]}")
+        print(f"Cumulative Return: {metrics['cumulative_return']*100:.2f}%")
+        print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.3f}")
+        print(f"Max Drawdown: {metrics['max_drawdown']*100:.2f}%")
+        print(f"Trades: {metrics['num_trades']} | Wins: {metrics['wins']} | Loses: {metrics['loses']} | Win Rate: {metrics['win_rate']*100:.2f}%")
 
-    print("\nTrade Statistics:")
-    for k, v in stats.items():
-        if isinstance(v, float):
-            print(f"  {k}: {v:.4f}")
-        else:
-            print(f"  {k}: {v}")
+    # Aggregate results across windows
+    if len(all_metrics) > 0:
+        avg_cr = np.mean([m["cumulative_return"] for m in all_metrics])
+        avg_sr = np.mean([m["sharpe_ratio"] for m in all_metrics])
+        avg_mdd = np.mean([m["max_drawdown"] for m in all_metrics])
+        total_trades = np.sum([m["num_trades"] for m in all_metrics])
+        total_wins = np.sum([m["wins"] for m in all_metrics])
+        total_loses = np.sum([m["loses"] for m in all_metrics])
+        win_rate = total_wins / max(1, (total_wins + total_loses))
 
-    # Plot results
-    plot_results(times, test_prices[env.start_index:env.start_index + len(env.portfolio_values)], env)
+        print("\n========== Overall Walk-forward Results ==========")
+        print(f"Windows: {len(all_metrics)}")
+        print(f"Average Cumulative Return: {avg_cr*100:.2f}%")
+        print(f"Average Sharpe Ratio: {avg_sr:.3f}")
+        print(f"Average Max Drawdown: {avg_mdd*100:.2f}%")
+        print(f"Total Trades: {total_trades} | Wins: {total_wins} | Loses: {total_loses} | Win Rate: {win_rate*100:.2f}%")
 
-    # Print pip command for completeness
-    print("\nTo install required dependencies:")
-    print("pip install pandas numpy ta plotly tqdm scikit-learn torch")
+    # Plot from the last test window
+    if last_payload is not None:
+        plot_results(last_payload, title_suffix="(Last Walk-Forward Test Window)")
 
 if __name__ == "__main__":
     main()
