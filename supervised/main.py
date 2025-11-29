@@ -1,60 +1,32 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Supervised trade execution model with walk-forward LSTM and Plotly/Dash visualization.
-
-References:
-- Dixon, M. (2017). A High Frequency Trade Execution Model for Supervised Learning.
-- Tang, F. (2023). Application of supervised learning models in the Chinese futures market.
-- Kangin & Pugeault (2018). Continuous Control with a Combination of Supervised and Reinforcement Learning.
-
-What this file does:
-1) Load BTC-USD 1-min data (~130k rows).
-2) Compute TA indicators (ta library).
-3) Volatility-scaled barrier labeling (triple-barrier style time-out).
-4) Train a PyTorch LSTM classifier with walk-forward splits (progress bars).
-5) Convert predicted probabilities into trade points and sizes (target position sizing).
-6) Backtest: execute trades, compute PnL, mark sell-win and sell-lose.
-7) Print evaluation metrics to terminal; launch a single-tab Dash app with multiple figures.
-
-Notes:
-- To keep runtime reasonable on a laptop, default windows are modest and a subset of tail data is used. Adjust config in MAIN CONFIG.
-- Uses mps (Mac), cuda (GPU), else cpu.
-"""
+# supervised_guided_rl_btcusd.py
+# pip install pandas numpy scipy scikit-learn torch tqdm plotly ta
 
 import os
-import sys
 import math
-import warnings
-warnings.filterwarnings("ignore")
+import copy
+import random
+from dataclasses import dataclass
+from typing import Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-
-# TA features
-import ta
-
-# ML / Metrics
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score, precision_score, recall_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils.class_weight import compute_class_weight
-
-# PyTorch
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
-# Plotly/Dash
+from sklearn.metrics import classification_report, confusion_matrix
+from scipy.special import softmax
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import dash
-from dash import dcc, html
 
-# ---------------------------------------------------------
-# 0) Data loader provided by the user
-# ---------------------------------------------------------
+import ta
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# ---------------------------
+# 1) Data loading (provided)
+# ---------------------------
+
 def load_data() -> pd.DataFrame:
     url = "https://raw.githubusercontent.com/H3cth0r/stonks-data/refs/heads/main/data/CRYPTO/BTC-USD/data_0.csv"
     column_names = ["Datetime", "Close", "High", "Low", "Open", "Volume"]
@@ -67,625 +39,734 @@ def load_data() -> pd.DataFrame:
     df = df.sort_index()
     return df
 
-# ---------------------------------------------------------
-# 1) Feature Engineering using ta
-# ---------------------------------------------------------
+# ---------------------------
+# 2) Features: TA, FFD, Triple Barrier
+# ---------------------------
+
 def add_ta_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # Basic sanity
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        if col not in df.columns:
-            raise ValueError(f"Missing column {col}")
-    df["Ret1"] = df["Close"].pct_change().fillna(0.0)
-    df["LogRet"] = np.log(df["Close"]).diff().fillna(0.0)
+    df['ret_1'] = df['Close'].pct_change()
+    df['logret_1'] = np.log(df['Close']).diff()
+    df['vol_ewm'] = df['ret_1'].ewm(span=60, min_periods=60).std()
+    df['vol_ewm'] = df['vol_ewm'].bfill()
 
-    # Volatility
-    df["Vol_10"] = df["Ret1"].rolling(10).std().fillna(method="bfill")
-    df["Vol_30"] = df["Ret1"].rolling(30).std().fillna(method="bfill")
-    df["ATR_14"] = ta.volatility.AverageTrueRange(high=df["High"], low=df["Low"], close=df["Close"], window=14).average_true_range()
+    df['rsi'] = ta.momentum.RSIIndicator(df['Close'], window=14, fillna=True).rsi()
+    macd = ta.trend.MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9, fillna=True)
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+    df['macd_hist'] = macd.macd_diff()
 
-    # Trend
-    df["EMA_10"] = ta.trend.EMAIndicator(close=df["Close"], window=10).ema_indicator()
-    df["EMA_20"] = ta.trend.EMAIndicator(close=df["Close"], window=20).ema_indicator()
-    df["SMA_50"] = ta.trend.SMAIndicator(close=df["Close"], window=50).sma_indicator()
-    macd = ta.trend.MACD(close=df["Close"])
-    df["MACD"] = macd.macd()
-    df["MACD_Signal"] = macd.macd_signal()
-    df["MACD_Hist"] = macd.macd_diff()
+    stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=14, smooth_window=3, fillna=True)
+    df['stoch_k'] = stoch.stoch()
+    df['stoch_d'] = stoch.stoch_signal()
 
-    # Momentum
-    df["RSI_14"] = ta.momentum.RSIIndicator(close=df["Close"], window=14).rsi()
-    stoch = ta.momentum.StochasticOscillator(high=df["High"], low=df["Low"], close=df["Close"], window=14, smooth_window=3)
-    df["Stoch_K"] = stoch.stoch()
-    df["Stoch_D"] = stoch.stoch_signal()
+    bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2, fillna=True)
+    df['bb_h'] = bb.bollinger_hband()
+    df['bb_l'] = bb.bollinger_lband()
+    df['bb_w'] = (df['bb_h'] - df['bb_l']) / df['Close'].replace(0, np.nan)
+    df['ema_20'] = ta.trend.EMAIndicator(df['Close'], window=20, fillna=True).ema_indicator()
+    df['ema_50'] = ta.trend.EMAIndicator(df['Close'], window=50, fillna=True).ema_indicator()
+    df['ema_diff'] = (df['ema_20'] - df['ema_50']) / df['Close'].replace(0, np.nan)
 
-    # Volume-based
-    df["OBV"] = ta.volume.OnBalanceVolumeIndicator(close=df["Close"], volume=df["Volume"]).on_balance_volume()
-    try:
-        df["MFI_14"] = ta.volume.MFIIndicator(high=df["High"], low=df["Low"], close=df["Close"], volume=df["Volume"], window=14).money_flow_index()
-    except:
-        df["MFI_14"] = np.nan
+    df['mfi'] = ta.volume.MFIIndicator(high=df['High'], low=df['Low'], close=df['Close'], volume=df['Volume'], window=14, fillna=True).money_flow_index()
 
-    # Volatility bands
-    bb = ta.volatility.BollingerBands(close=df["Close"], window=20, window_dev=2)
-    df["BB_H"] = bb.bollinger_hband()
-    df["BB_L"] = bb.bollinger_lband()
-    df["BB_PctB"] = bb.bollinger_pband()
-
-    # Price distances
-    df["Dist_EMA20"] = (df["Close"] - df["EMA_20"]) / df["Close"]
-    df["Dist_SMA50"] = (df["Close"] - df["SMA_50"]) / df["Close"]
-
-    # Fill missing
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(method="bfill")
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
     return df
 
-# ---------------------------------------------------------
-# 2) Labeling: volatility-scaled barrier (triple-barrier style)
-#    If future return exceeds +k_up*vol, label = 1
-#    If future return falls below -k_dn*vol, label = -1
-#    Else after horizon timeout -> 0
-# ---------------------------------------------------------
-def label_triple_barrier(df: pd.DataFrame, horizon: int = 30, k_up: float = 2.0, k_dn: float = 2.0, vol_window: int = 60) -> pd.Series:
-    close = df["Close"].values
-    vol = df["Ret1"].rolling(vol_window).std().fillna(method="bfill").values
-    labels = np.zeros(len(df), dtype=int)
-    n = len(df)
+def fracdiff_fixed_width(x: pd.Series, d: float = 0.3, tol: float = 1e-3, max_lag: int = 500) -> pd.Series:
+    x = x.dropna().astype(float)
+    w = [1.0]
+    k = 1
+    while k < max_lag:
+        w_k = w[-1] * (-(d - (k - 1))) / k
+        if abs(w_k) < tol:
+            break
+        w.append(w_k)
+        k += 1
+    w = np.array(w)[::-1]
+    out = np.full_like(x.values, np.nan, dtype=float)
+    vals = x.values
+    for i in range(len(vals)):
+        if i >= len(w) - 1:
+            window = vals[i - len(w) + 1: i + 1]
+            out[i] = np.dot(w, window)
+    return pd.Series(out, index=x.index, name=f'ffd_d{d}')
 
-    # This simplified triple-barrier checks horizon return against vol-scaled thresholds
-    # (path-independent simplification for speed)
-    fut_ret = (pd.Series(close).shift(-horizon) / pd.Series(close) - 1.0).fillna(0.0).values
-    up_thr = k_up * vol
-    dn_thr = k_dn * vol
+def add_ffd_feature(df: pd.DataFrame, d: float = 0.3) -> pd.DataFrame:
+    df = df.copy()
+    df['ffd_close'] = fracdiff_fixed_width(df['Close'], d=d, tol=1e-3, max_lag=500)
+    df['ffd_close'] = df['ffd_close'].bfill()
+    return df
 
-    labels[fut_ret > up_thr] = 1
-    labels[fut_ret < -dn_thr] = -1
-    # else 0
+def triple_barrier_labels(close: pd.Series, vol: pd.Series, up_mult: float = 5.0, dn_mult: float = 5.0, horizon: int = 120) -> pd.Series:
+    """
+    Triple Barrier labels with longer horizon and larger multipliers to produce more neutral labels,
+    improving class balance for training stability.
+    """
+    n = len(close)
+    labels = np.zeros(n, dtype=int)
+    idx = close.index
+    cvals = close.values
+    vol = vol.reindex(idx)
+    vol = vol.bfill()
+    vvals = vol.values
+    for i in tqdm(range(n - horizon), desc="Labeling (Triple Barrier)", leave=False):
+        price0 = cvals[i]
+        up_bar = price0 * (1 + up_mult * vvals[i])
+        dn_bar = price0 * (1 - dn_mult * vvals[i])
+        label = 0
+        for j in range(1, horizon + 1):
+            p = cvals[i + j]
+            if p >= up_bar:
+                label = 1
+                break
+            if p <= dn_bar:
+                label = -1
+                break
+        labels[i] = label
+    labels[-horizon:] = 0
+    return pd.Series(labels, index=idx, name='tb_label')
 
-    return pd.Series(labels, index=df.index, name="Label")
+# ---------------------------
+# 3) LSTM classifier with focal loss (better for imbalance)
+# ---------------------------
 
-# ---------------------------------------------------------
-# 3) Sequence dataset for LSTM
-# ---------------------------------------------------------
-class SeqDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray, seq_len: int):
-        self.X = X
-        self.y = y
-        self.seq_len = seq_len
-
-    def __len__(self):
-        return len(self.X) - self.seq_len + 1
-
-    def __getitem__(self, idx):
-        x_seq = self.X[idx:idx+self.seq_len, :]
-        y_t = self.y[idx+self.seq_len-1]
-        return torch.tensor(x_seq, dtype=torch.float32), torch.tensor(y_t, dtype=torch.long)
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    try:
+        if torch.backends.mps.is_available():
+            return torch.device('mps')
+    except Exception:
+        pass
+    return torch.device('cpu')
 
 class LSTMClassifier(nn.Module):
-    def __init__(self, n_features: int, hidden: int = 64, num_layers: int = 2, dropout: float = 0.2, n_classes: int = 3):
+    def __init__(self, input_dim: int, hidden: int = 96, layers: int = 2, dropout: float = 0.2, num_classes: int = 3):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=n_features, hidden_size=hidden, num_layers=num_layers, batch_first=True, dropout=dropout)
+        self.lstm = nn.LSTM(input_dim, hidden, num_layers=layers, batch_first=True, dropout=dropout)
         self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 64),
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, 96),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, n_classes)
+            nn.Linear(96, num_classes),
         )
-
     def forward(self, x):
-        # x: (B, T, F)
-        out, _ = self.lstm(x)    # (B, T, H)
-        out = out[:, -1, :]      # (B, H)
-        logits = self.head(out)  # (B, C)
+        out, _ = self.lstm(x)
+        logits = self.head(out[:, -1, :])
         return logits
 
-# ---------------------------------------------------------
-# 4) Walk-forward generator
-# ---------------------------------------------------------
-def generate_walk_forward_splits(df: pd.DataFrame, train_len: int, val_len: int, test_len: int, step: int):
-    """
-    Yields (train_idx, val_idx, test_idx) index arrays for walk-forward.
-    """
-    n = len(df)
-    start = 0
-    while start + train_len + val_len + test_len <= n:
-        train_idx = np.arange(start, start+train_len)
-        val_idx = np.arange(start+train_len, start+train_len+val_len)
-        test_idx = np.arange(start+train_len+val_len, start+train_len+val_len+test_len)
-        yield train_idx, val_idx, test_idx
-        start += step
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(reduction='none')
 
-# ---------------------------------------------------------
-# 5) Backtest engine
-# ---------------------------------------------------------
-def backtest_minute(
-    times: np.ndarray, prices: np.ndarray, probs: np.ndarray,
-    fee_bps: float = 5.0,  # 5 bps = 0.05%
-    risk_per_trade: float = 0.01,
-    vol_est: np.ndarray = None,
-    max_trade_units: float = 0.25,   # Max BTC per minute
-    min_lot: float = 0.001,          # Min BTC
-    initial_cash: float = 10_000.0
-):
-    """
-    Convert predicted probabilities into target positions and execute trades.
-    - probs: (N,3) for classes [-1,0,1] in that order.
-    - Position sizing: target_pos_btc ~ (p_up - p_down) * (risk_budget/vol).
-    - Buy/sell with market orders at next minute price, with fees.
-    Returns dict with equity curve, cash, holdings, trades log, sell markers separated into win/lose.
-    """
-    n = len(prices)
-    cash = initial_cash
-    btc = 0.0
-    equity = np.zeros(n)
-    cash_series = np.zeros(n)
-    hold_series = np.zeros(n)
-
-    if vol_est is None:
-        vol_est = pd.Series(prices).pct_change().rolling(60).std().fillna(method="bfill").values
-    vol_safe = np.where(vol_est <= 1e-6, 1e-6, vol_est)
-
-    fee_rate = fee_bps / 1e4
-
-    # Trade logs
-    trades = []  # dicts with time, side, qty, price, fee, pnl_on_close
-    open_trades = []  # track open buys (avg cost), we support position flipping with partial closes
-
-    # probability order: [-1,0,1]
-    for i in range(n):
-        price = prices[i]
-        p_dn, p_neu, p_up = probs[i]
-        signal_strength = p_up - p_dn
-        # equity update
-        equity[i] = cash + btc * price
-        cash_series[i] = cash
-        hold_series[i] = btc
-
-        # Compute target position by volatility scaling
-        target_notional = equity[i] * risk_per_trade * np.clip(signal_strength, -1.0, 1.0) / vol_safe[i]
-        target_btc = target_notional / price
-        # Clamp target BTC to a reasonable range (e.g., -2 BTC .. +2 BTC)
-        target_btc = float(np.clip(target_btc, -2.0, 2.0))
-
-        # Determine trade to move toward target position
-        delta_btc = target_btc - btc
-
-        # Limit per-minute change
-        trade_btc = float(np.clip(delta_btc, -max_trade_units, max_trade_units))
-
-        # Respect min lot
-        if abs(trade_btc) < min_lot:
-            continue
-
-        # Execute at price with fee
-        trade_value = trade_btc * price
-        trade_fee = abs(trade_value) * fee_rate
-
-        if trade_btc > 0:
-            # BUY
-            if cash >= (trade_value + trade_fee):
-                cash -= (trade_value + trade_fee)
-                btc += trade_btc
-                open_trades.append({"qty": trade_btc, "price": price, "value": trade_value, "time": times[i]})
-                trades.append({"time": times[i], "side": "BUY", "qty": trade_btc, "price": price, "fee": trade_fee, "pnl_close": None})
+    def forward(self, logits, targets):
+        ce = self.ce(logits, targets)  # [N]
+        pt = torch.softmax(logits, dim=1)
+        pt = pt.gather(1, targets.view(-1,1)).squeeze(1)
+        loss = (1 - pt) ** self.gamma * ce
+        if self.alpha is not None:
+            alpha_t = self.alpha.gather(0, targets)
+            loss = alpha_t * loss
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
         else:
-            # SELL (closing or shorting -> we only allow long-only plus reducing position; if negative target, we flatten and optionally go short=off)
-            sell_qty = min(abs(trade_btc), btc)  # do not short; restrict selling up to current btc
-            if sell_qty > 0:
-                sell_val = sell_qty * price
-                sell_fee = sell_val * fee_rate
-                cash += (sell_val - sell_fee)
-                btc -= sell_qty
-                # Match FIFO to compute realized PnL
-                qty_to_match = sell_qty
-                realized = 0.0
-                while qty_to_match > 1e-12 and len(open_trades) > 0:
-                    lot = open_trades[0]
-                    take_qty = min(qty_to_match, lot["qty"])
-                    realized += (price - lot["price"]) * take_qty
-                    lot["qty"] -= take_qty
-                    qty_to_match -= take_qty
-                    if lot["qty"] <= 1e-12:
-                        open_trades.pop(0)
-                trades.append({"time": times[i], "side": "SELL", "qty": sell_qty, "price": price, "fee": sell_fee, "pnl_close": realized})
+            return loss
 
-    # Final equity recompute
-    for i in range(n):
-        equity[i] = cash_series[i] + hold_series[i] * prices[i]
+def make_sequences(X: np.ndarray, y: np.ndarray, seq_len: int = 120) -> Tuple[np.ndarray, np.ndarray]:
+    xs, ys = [], []
+    for i in range(seq_len, len(X)):
+        xs.append(X[i - seq_len:i, :])
+        ys.append(y[i])
+    return np.array(xs, dtype=np.float32), np.array(ys, dtype=np.int64)
 
-    # Identify sell-win and sell-lose markers
-    sell_times_win = []
-    sell_prices_win = []
-    sell_times_lose = []
-    sell_prices_lose = []
-    buy_times = []
-    buy_prices = []
+# ---------------------------
+# 4) TIM and position mapping
+# ---------------------------
 
-    for tr in trades:
-        if tr["side"] == "BUY":
-            buy_times.append(tr["time"])
-            buy_prices.append(tr["price"])
-        elif tr["side"] == "SELL":
-            pnl = tr.get("pnl_close", 0.0)
-            if pnl is not None and pnl > 0:
-                sell_times_win.append(tr["time"])
-                sell_prices_win.append(tr["price"])
-            else:
-                sell_times_lose.append(tr["time"])
-                sell_prices_lose.append(tr["price"])
+def confusion_and_tim(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    C = confusion_matrix(y_true, y_pred, labels=[-1,0,1])
+    T = np.array([
+        [ 1.0, -0.05, -1.0],   # true -1
+        [-0.05, 0.10, -0.05],  # true 0
+        [-1.0, -0.05,  1.0],   # true +1
+    ], dtype=float)
+    exp_value = float(np.trace(C @ T.T)) / max(1, C.sum())
+    return C, T, exp_value
 
+def probs_to_position(prob_up: float, prob_dn: float, prob_flat: float, T: np.ndarray, max_pos: float = 0.5, edge_thresh: float = 0.05) -> float:
+    p_vec = np.array([prob_dn, prob_flat, prob_up], dtype=float)
+    E_long  = float(np.dot(p_vec, T[:, 2]))
+    E_flat  = float(np.dot(p_vec, T[:, 1]))
+    E_short = float(np.dot(p_vec, T[:, 0]))
+    best_action = np.argmax([E_short, E_flat, E_long])  # 0=short,1=flat,2=long
+    edges = [E_short - E_flat, 0.0, E_long - E_flat]
+    edge = edges[best_action]
+    if edge <= edge_thresh:
+        return 0.0
+    if best_action == 2:
+        return min(max_pos, max(0.0, edge))
+    elif best_action == 0:
+        return 0.0  # disable shorting for spot safety
+    else:
+        return 0.0
+
+def smooth_positions(pos: pd.Series, ema_span: int = 30) -> pd.Series:
+    return pos.ewm(span=ema_span, adjust=False).mean().clip(lower=0.0, upper=1.0)
+
+# ---------------------------
+# 5) Backtester (no margin, no short)
+# ---------------------------
+
+@dataclass
+class BacktestResult:
+    df_trades: pd.DataFrame
+    equity_curve: pd.Series
+    cash_curve: pd.Series
+    holdings_curve: pd.Series
+    metrics: Dict[str, float]
+
+def compute_metrics(equity: pd.Series, returns: pd.Series) -> Dict[str, float]:
+    ret = returns.dropna()
+    ann_scale = np.sqrt(525600.0)  # 365*24*60
+    sharpe = (ret.mean() / (ret.std() + 1e-12)) * ann_scale
+    downside = ret[ret < 0]
+    sortino = (ret.mean() / (downside.std() + 1e-12)) * ann_scale
+    roll_max = equity.cummax()
+    dd = (equity / roll_max - 1.0)
+    max_dd = dd.min()
+    total_return = equity.iloc[-1] / equity.iloc[0] - 1.0
     return {
-        "equity": equity,
-        "cash": cash_series,
-        "holdings": hold_series,
-        "trades": trades,
-        "buy_markers": (np.array(buy_times), np.array(buy_prices)),
-        "sell_win_markers": (np.array(sell_times_win), np.array(sell_prices_win)),
-        "sell_lose_markers": (np.array(sell_times_lose), np.array(sell_prices_lose)),
+        "Total Return": float(total_return),
+        "Sharpe": float(sharpe),
+        "Sortino": float(sortino),
+        "Max Drawdown": float(max_dd),
     }
 
-# ---------------------------------------------------------
-# 6) Trading metrics
-# ---------------------------------------------------------
-def kpis_from_equity(equity: np.ndarray, times: np.ndarray, rf: float = 0.0):
-    """
-    Compute trading KPIs for minute-level equity curve.
-    Annualization factor assumes ~365*24*60 minutes/year.
-    """
-    eps = 1e-12
-    rets = np.diff(equity) / (equity[:-1] + eps)
-    ann_factor = 365 * 24 * 60
+def backtest_signals(
+    df: pd.DataFrame,
+    positions: pd.Series,
+    fee_bps: float = 7.5,
+    slippage_bps: float = 1.0,
+    initial_cash: float = 10000.0,
+) -> BacktestResult:
+    fee = fee_bps / 10000.0
+    slippage = slippage_bps / 10000.0
+    price = df['Close']
+    idx = df.index
 
-    if len(rets) == 0:
-        return {"CAGR": 0, "Sharpe": 0, "Sortino": 0, "MaxDD": 0, "MaxDD_Days": 0}
+    equity = []
+    cash = []
+    holdings = []
+    trades = []
 
-    mean_ret = np.mean(rets)
-    std_ret = np.std(rets) + eps
-    downside = rets[rets < 0]
-    dd_std = np.std(downside) + eps
+    current_cash = initial_cash
+    current_units = 0.0
 
-    sharpe = (mean_ret - rf/ann_factor) / std_ret * math.sqrt(ann_factor)
-    sortino = (mean_ret - rf/ann_factor) / dd_std * math.sqrt(ann_factor)
+    for t in tqdm(range(len(idx)), desc="Backtest", leave=False):
+        p = float(price.iloc[t])
+        target_pos = float(np.clip(positions.iloc[t], 0.0, 1.0))  # long-only fraction
+        current_equity = current_cash + current_units * p
+        target_units = target_pos * current_equity / p if p > 0 else 0.0
+        delta_units = target_units - current_units
 
-    # CAGR: from first to last
-    total_ret = equity[-1] / equity[0] - 1.0
-    years = max((times[-1] - times[0]).astype('timedelta64[m]').astype(int) / (60*24*365), 1e-9)
-    cagr = (1.0 + total_ret) ** (1.0 / years) - 1.0 if years > 0 else 0.0
-
-    # Max Drawdown
-    cum = equity
-    peak = np.maximum.accumulate(cum)
-    drawdown = (cum - peak) / (peak + 1e-12)
-    maxdd = drawdown.min()
-    # approximate duration
-    maxdd_days = 0
-    if len(drawdown) > 0:
-        end_idx = np.argmin(drawdown)
-        start_idx = np.argmax(cum[:end_idx+1])
-        maxdd_days = (times[end_idx] - times[start_idx]).astype('timedelta64[D]').astype(int)
-
-    return {"CAGR": cagr, "Sharpe": sharpe, "Sortino": sortino, "MaxDD": maxdd, "MaxDD_Days": maxdd_days}
-
-# ---------------------------------------------------------
-# 7) Main training & evaluation
-# ---------------------------------------------------------
-def main():
-    print("Loading data...")
-    df = load_data()
-    print(f"Data loaded: {df.index.min()} to {df.index.max()}, rows={len(df)}")
-
-    # Add features
-    print("Computing TA features...")
-    df = add_ta_features(df)
-
-    # Label
-    print("Labeling (volatility-scaled barriers)...")
-    df["Label"] = label_triple_barrier(df, horizon=30, k_up=2.0, k_dn=2.0, vol_window=60)
-
-    # Clean rows for which all features exist
-    feature_cols = [
-        "Ret1","LogRet","Vol_10","Vol_30","ATR_14","EMA_10","EMA_20","SMA_50",
-        "MACD","MACD_Signal","MACD_Hist","RSI_14","Stoch_K","Stoch_D","OBV","MFI_14","BB_H","BB_L","BB_PctB","Dist_EMA20","Dist_SMA50"
-    ]
-    cols_needed = feature_cols + ["Label", "Close"]
-    df = df[cols_needed].dropna().copy()
-
-    # To keep runtime moderate, focus on a recent tail
-    # You can expand this later to use full data.
-    TAIL = 80_000  # adjust as needed (smaller=quicker)
-    if len(df) > TAIL:
-        df = df.iloc[-TAIL:].copy()
-
-    # Standardize features (fit on training windows only later; here we prepare arrays)
-    # We will fit scaler per fold, respecting walk-forward protocol.
-    X_all = df[feature_cols].values.astype(np.float32)
-    y_all = df["Label"].values.astype(int)
-    time_all = df.index.values
-    close_all = df["Close"].values.astype(np.float32)
-
-    # LSTM config
-    seq_len = 32
-    batch_size = 512
-    hidden = 64
-    layers = 2
-    dropout = 0.2
-    lr = 1e-3
-    max_epochs = 6  # keep small for speed; can increase
-    patience = 2
-
-    # Walk-forward config (minutes)
-    # Train 20 days, Val 3 days, Test 5 days, step 5 days
-    train_len = 20*24*60
-    val_len = 3*24*60
-    test_len = 5*24*60
-    step = test_len
-
-    device = torch.device("cpu")
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    print(f"Using device: {device}")
-
-    # Storage for concatenated test predictions for backtest
-    all_test_idx = []
-    all_test_probs = []
-    all_test_true = []
-
-    fold_num = 0
-
-    # Walk-forward
-    splits = list(generate_walk_forward_splits(df, train_len, val_len, test_len, step))
-    if len(splits) == 0:
-        print("Not enough rows for walk-forward with current window sizes.")
-        sys.exit(0)
-
-    print(f"Starting walk-forward with {len(splits)} folds...")
-    for (tr_idx, va_idx, te_idx) in tqdm(splits, desc="Walk-forward folds"):
-        fold_num += 1
-
-        # Fit scaler on train only
-        scaler = StandardScaler()
-        scaler.fit(X_all[tr_idx])
-        X_tr = scaler.transform(X_all[tr_idx])
-        X_va = scaler.transform(X_all[va_idx])
-        X_te = scaler.transform(X_all[te_idx])
-        y_tr = y_all[tr_idx]
-        y_va = y_all[va_idx]
-        y_te = y_all[te_idx]
-
-        # Class weights to address imbalance
-        classes_present = np.unique(y_tr)
-        cw = compute_class_weight(class_weight="balanced", classes=np.array([-1,0,1]), y=y_tr)
-        # cw mapping is aligned with classes [-1,0,1] by ordering:
-        class_to_index = {-1:0, 0:1, 1:2}
-        weights = torch.tensor([cw[class_to_index[c]] for c in [-1,0,1]], dtype=torch.float32).to(device)
-
-        # Build datasets
-        ds_tr = SeqDataset(X_tr, y_tr, seq_len)
-        ds_va = SeqDataset(X_va, y_va, seq_len)
-        dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, drop_last=True)
-        dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, drop_last=False)
-
-        # Model
-        model = LSTMClassifier(n_features=X_tr.shape[1], hidden=hidden, num_layers=layers, dropout=dropout, n_classes=3).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-        criterion = nn.CrossEntropyLoss(weight=weights)
-
-        best_val = np.inf
-        no_improve = 0
-
-        # Train
-        for epoch in tqdm(range(1, max_epochs+1), desc=f"Fold {fold_num} train", leave=False):
-            model.train()
-            total_loss = 0.0
-            for xb, yb in dl_tr:
-                xb = xb.to(device)
-                yb_idx = torch.tensor([class_to_index[int(y.item())] for y in yb], dtype=torch.long, device=device)
-                optimizer.zero_grad()
-                logits = model(xb)
-                loss = criterion(logits, yb_idx)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item() * xb.size(0)
-            avg_tr = total_loss / max(1, len(ds_tr))
-
-            # Validate
-            model.eval()
-            with torch.no_grad():
-                total_v = 0.0
-                count_v = 0
-                for xb, yb in dl_va:
-                    xb = xb.to(device)
-                    yb_idx = torch.tensor([class_to_index[int(y.item())] for y in yb], dtype=torch.long, device=device)
-                    logits = model(xb)
-                    loss = criterion(logits, yb_idx)
-                    total_v += loss.item() * xb.size(0)
-                    count_v += xb.size(0)
-                avg_va = total_v / max(1, count_v)
-
-            tqdm.write(f"Fold {fold_num} | Epoch {epoch} | TrainLoss={avg_tr:.4f} | ValLoss={avg_va:.4f}")
-
-            if avg_va + 1e-6 < best_val:
-                best_val = avg_va
-                best_state = {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
-                no_improve = 0
+        if abs(delta_units) > 1e-9:
+            # Enforce no shorting and no margin
+            if delta_units > 0:
+                trade_price = p * (1 + slippage)
+                max_buy_units = max(0.0, current_cash / (trade_price * (1 + fee)))
+                delta_units = min(delta_units, max_buy_units)
+                trade_cost = delta_units * trade_price
+                fee_cost = trade_cost * fee
+                current_cash -= (trade_cost + fee_cost)
+                current_units += delta_units
+                if delta_units > 0:
+                    trades.append({"time": idx[t], "type": "BUY", "units": float(delta_units), "price": trade_price, "fee": fee_cost})
             else:
-                no_improve += 1
-                if no_improve >= patience:
-                    tqdm.write(f"Early stop on fold {fold_num} at epoch {epoch}")
-                    break
+                # Sell only up to current holdings
+                delta_units = max(delta_units, -current_units)
+                trade_price = p * (1 - slippage)
+                trade_proceeds = (-delta_units) * trade_price
+                fee_cost = trade_proceeds * fee
+                current_cash += (trade_proceeds - fee_cost)
+                current_units += delta_units
+                if delta_units < 0:
+                    trades.append({"time": idx[t], "type": "SELL", "units": float(delta_units), "price": trade_price, "fee": fee_cost})
 
-        # Load best
+        current_equity = current_cash + current_units * p
+        equity.append(current_equity)
+        cash.append(current_cash)
+        holdings.append(current_units)
+
+    equity_s = pd.Series(equity, index=idx, name='equity')
+    cash_s = pd.Series(cash, index=idx, name='cash')
+    hold_s = pd.Series(holdings, index=idx, name='units')
+    ret = equity_s.pct_change().fillna(0.0)
+    metrics = compute_metrics(equity_s, ret)
+    df_trades = pd.DataFrame(trades)
+
+    # Mark Sell wins
+    if not df_trades.empty:
+        df_trades['is_win'] = False
+        avg_entry_price = 0.0
+        cum_units = 0.0
+        for i, row in df_trades.iterrows():
+            if row['type'] == 'BUY':
+                total_cost = avg_entry_price * cum_units + row['price'] * row['units']
+                cum_units += row['units']
+                avg_entry_price = (total_cost / cum_units) if cum_units > 0 else 0.0
+            else:
+                pnl = (row['price'] - avg_entry_price) * (-row['units'])  # units negative
+                df_trades.at[i, 'is_win'] = (pnl > 0)
+                cum_units += row['units']
+                if cum_units <= 1e-9:
+                    avg_entry_price = 0.0
+
+    return BacktestResult(df_trades=df_trades, equity_curve=equity_s, cash_curve=cash_s, holdings_curve=hold_s, metrics=metrics)
+
+def plot_results(price: pd.Series, result: BacktestResult, title: str, filename: str = "plots.html"):
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.02,
+                        row_heights=[0.35, 0.25, 0.20, 0.20],
+                        subplot_titles=("BTC-USD Price & Trades", "Portfolio Value", "Cash (Credit) Value", "Holdings (Units)"))
+    fig.add_trace(go.Scatter(x=price.index, y=price.values, name="Price", line=dict(color="black")), row=1, col=1)
+    if not result.df_trades.empty:
+        buys = result.df_trades[result.df_trades['type'] == 'BUY']
+        sells = result.df_trades[result.df_trades['type'] == 'SELL']
+        fig.add_trace(go.Scatter(x=buys['time'], y=[price.loc[t] if t in price.index else None for t in buys['time']],
+                                 mode='markers', name='Buy',
+                                 marker=dict(symbol='triangle-up', color='blue', size=8)), row=1, col=1)
+        if not sells.empty:
+            sells_win = sells[sells['is_win']]
+            sells_lose = sells[~sells['is_win']]
+            fig.add_trace(go.Scatter(x=sells_win['time'], y=[price.loc[t] if t in price.index else None for t in sells_win['time']],
+                                     mode='markers', name='Sell (Win)',
+                                     marker=dict(symbol='x', color='green', size=8)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=sells_lose['time'], y=[price.loc[t] if t in price.index else None for t in sells_lose['time']],
+                                     mode='markers', name='Sell (Lose)',
+                                     marker=dict(symbol='x', color='red', size=8)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=result.equity_curve.index, y=result.equity_curve.values, name="Equity", line=dict(color="purple")), row=2, col=1)
+    fig.add_trace(go.Scatter(x=result.cash_curve.index, y=result.cash_curve.values, name="Cash", line=dict(color="teal")), row=3, col=1)
+    fig.add_trace(go.Scatter(x=result.holdings_curve.index, y=result.holdings_curve.values, name="Units", line=dict(color="orange")), row=4, col=1)
+    fig.update_layout(title=title, height=1000, showlegend=True)
+    fig.write_html(filename)
+    print(f"Plot saved to {filename}")
+
+# ---------------------------
+# 6) DDPG with guided actions
+# ---------------------------
+
+class ReplayBuffer:
+    def __init__(self, capacity: int = 200_000):
+        self.capacity = capacity
+        self.buf = []
+        self.pos = 0
+    def push(self, s, a, r, s2, d):
+        if len(self.buf) < self.capacity:
+            self.buf.append(None)
+        self.buf[self.pos] = (s, a, r, s2, d)
+        self.pos = (self.pos + 1) % self.capacity
+    def sample(self, batch_size: int):
+        batch = random.sample(self.buf, batch_size)
+        s, a, r, s2, d = map(np.array, zip(*batch))
+        return s, a, r.reshape(-1,1), s2, d.reshape(-1,1)
+    def __len__(self):
+        return len(self.buf)
+
+class Actor(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+            nn.Tanh(),  # [-1,1]
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Critic(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim + 1, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+    def forward(self, x, a):
+        return self.net(torch.cat([x, a], dim=-1))
+
+def soft_update(target, source, tau=0.01):
+    for t, s in zip(target.parameters(), source.parameters()):
+        t.data.copy_(t.data * (1.0 - tau) + s.data * tau)
+
+@dataclass
+class RLEnvConfig:
+    fee_bps: float = 7.5
+    slippage_bps: float = 1.0
+    risk_penalty: float = 0.0
+    max_position: float = 1.0
+
+class TradingEnv:
+    """
+    Minute environment, long-only, no margin.
+    State = features + probs + prev_target.
+    Action in [-1,1] mapped to [0,1] target position.
+    Reward = log equity change minus small penalty.
+    """
+    def __init__(self, df: pd.DataFrame, X: np.ndarray, probs: np.ndarray, initial_cash: float = 10000.0, cfg: RLEnvConfig = RLEnvConfig()):
+        self.df = df
+        self.p = df['Close'].values.astype(float)
+        self.X = X
+        self.probs = probs
+        self.initial_cash = initial_cash
+        self.cfg = cfg
+        self.reset()
+
+    def reset(self, start_idx: int = 0) -> np.ndarray:
+        self.t = start_idx
+        self.cash = self.initial_cash
+        self.units = 0.0
+        self.prev_target = 0.0
+        self.equity = self.initial_cash
+        return self._get_state()
+
+    def _get_state(self) -> np.ndarray:
+        feat = self.X[self.t]
+        prob = self.probs[self.t]
+        pos = np.array([self.prev_target], dtype=np.float32)
+        return np.concatenate([feat, prob, pos], axis=0)
+
+    def step(self, a_raw: float) -> Tuple[np.ndarray, float, bool]:
+        # map [-1,1] -> [0,1]
+        a_target = float(np.clip((a_raw + 1.0) / 2.0, 0.0, self.cfg.max_position))
+        price_t = self.p[self.t]
+        equity = self.cash + self.units * price_t
+        target_units = a_target * equity / price_t if price_t > 0 else 0.0
+        delta_units = target_units - self.units
+
+        fee = self.cfg.fee_bps / 10000.0
+        slip = self.cfg.slippage_bps / 10000.0
+
+        if abs(delta_units) > 1e-9:
+            if delta_units > 0:
+                trade_price = price_t * (1 + slip)
+                max_buy_units = max(0.0, self.cash / (trade_price * (1 + fee)))
+                delta_units = min(delta_units, max_buy_units)
+                trade_cost = delta_units * trade_price
+                fee_cost = trade_cost * fee
+                self.cash -= (trade_cost + fee_cost)
+                self.units += delta_units
+            else:
+                delta_units = max(delta_units, -self.units)
+                trade_price = price_t * (1 - slip)
+                proceeds = (-delta_units) * trade_price
+                fee_cost = proceeds * fee
+                self.cash += (proceeds - fee_cost)
+                self.units += delta_units
+
+        t_next = self.t + 1
+        done = t_next >= (len(self.p) - 1)
+        price_next = self.p[t_next] if not done else self.p[self.t]
+        equity_prev = self.cash + self.units * price_t
+        equity_next = self.cash + self.units * price_next
+        reward = math.log(max(equity_next, 1e-12)) - math.log(max(equity_prev, 1e-12))
+        reward -= self.cfg.risk_penalty * abs(delta_units)
+        self.t = t_next
+        self.prev_target = a_target
+        s_next = self._get_state()
+        return s_next, float(reward), done
+
+# ---------------------------
+# 7) Main pipeline
+# ---------------------------
+
+def main():
+    device = get_device()
+    print("Device:", device)
+
+    # Data and features
+    df0 = load_data()
+    df = add_ta_features(df0)
+    df = add_ffd_feature(df, d=0.3)
+    labels = triple_barrier_labels(df['Close'], df['vol_ewm'], up_mult=5.0, dn_mult=5.0, horizon=120)
+    df = df.join(labels).dropna()
+
+    # Split
+    n = len(df)
+    i_train = int(n * 0.6)
+    i_val = int(n * 0.75)
+    train_df = df.iloc[:i_train].copy()
+    val_df = df.iloc[i_train:i_val].copy()
+    test_df = df.iloc[i_val:].copy()
+
+    use_cols = ['Close','High','Low','Open','Volume',
+                'ret_1','logret_1','vol_ewm','rsi','macd','macd_signal','macd_hist',
+                'stoch_k','stoch_d','bb_w','ema_diff','mfi','ffd_close']
+    use_cols = [c for c in use_cols if c in df.columns]
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(train_df[use_cols].values)
+    X_val = scaler.transform(val_df[use_cols].values)
+    X_test = scaler.transform(test_df[use_cols].values)
+    y_train = train_df['tb_label'].values
+    y_val = val_df['tb_label'].values
+    y_test = test_df['tb_label'].values
+
+    # Sequence data
+    seq_len = 120
+    Xtr_seq, ytr_seq = make_sequences(X_train, y_train, seq_len=seq_len)
+    Xva_seq, yva_seq = make_sequences(X_val, y_val, seq_len=seq_len)
+    Xte_seq, yte_seq = make_sequences(X_test, y_test, seq_len=seq_len)
+
+    # LSTM model
+    model = LSTMClassifier(input_dim=Xtr_seq.shape[-1], hidden=96, layers=2, dropout=0.2, num_classes=3).to(device)
+    # Focal alpha: inverse of class frequencies (based on train labels)
+    cls_counts = np.array([np.sum(y_train == -1), np.sum(y_train == 0), np.sum(y_train == 1)], dtype=float)
+    freq = cls_counts / cls_counts.sum()
+    alpha = torch.tensor(1.0 - freq, dtype=torch.float32, device=device)
+    loss_fn = FocalLoss(alpha=alpha, gamma=2.0, reduction='mean')
+    opt = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=2)  # verbose removed
+
+    # Balanced minibatches
+    bs = 256
+    epochs = 12
+    best_val = 1e9
+    best_state = None
+    patience = 3
+    no_improve = 0
+
+    # Build per-class index arrays
+    idx_neg = np.where(ytr_seq == -1)[0]
+    idx_zer = np.where(ytr_seq == 0)[0]
+    idx_pos = np.where(ytr_seq == 1)[0]
+    min_class = max(1, min(len(idx_neg), len(idx_zer), len(idx_pos)))
+
+    for epoch in range(epochs):
+        model.train()
+        # Sample equal from each class
+        sel_neg = np.random.choice(idx_neg, min_class, replace=True)
+        sel_zer = np.random.choice(idx_zer, min_class, replace=True)
+        sel_pos = np.random.choice(idx_pos, min_class, replace=True)
+        idxs = np.concatenate([sel_neg, sel_zer, sel_pos])
+        np.random.shuffle(idxs)
+
+        total_loss = 0.0
+        pbar = tqdm(range(0, len(idxs), bs), desc=f"LSTM Train Epoch {epoch+1}/{epochs}")
+        for k in pbar:
+            batch_idx = idxs[k:k+bs]
+            xb = torch.tensor(Xtr_seq[batch_idx], dtype=torch.float32, device=device)
+            yb = torch.tensor(ytr_seq[batch_idx] + 1, dtype=torch.long, device=device)  # {-1,0,1} -> {0,1,2}
+            opt.zero_grad()
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            total_loss += float(loss.item()) * len(batch_idx)
+            pbar.set_postfix(loss=float(loss.item()))
+
+        # Validation
+        model.eval()
+        with torch.no_grad():
+            xv = torch.tensor(Xva_seq, dtype=torch.float32, device=device)
+            yv = torch.tensor(yva_seq + 1, dtype=torch.long, device=device)
+            lv = loss_fn(model(xv), yv).item()
+        print(f"Epoch {epoch+1}: val_loss={lv:.6f}")
+        scheduler.step(lv)
+        if lv < best_val - 1e-4:
+            best_val = lv
+            best_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print("Early stopping.")
+                break
+
+    if best_state is not None:
         model.load_state_dict(best_state)
 
-        # Predict test
-        ds_te = SeqDataset(X_te, y_te, seq_len)
-        dl_te = DataLoader(ds_te, batch_size=1024, shuffle=False)
-        model.eval()
-        fold_probs = []
-        fold_true = []
-        with torch.no_grad():
-            for xb, yb in tqdm(dl_te, desc=f"Fold {fold_num} predict", leave=False):
-                xb = xb.to(device)
-                logits = model(xb)
-                prob = torch.softmax(logits, dim=-1).detach().cpu().numpy()
-                # map class order [0,1,2] => [-1,0,1] same order output:
-                # our mapping used y index [-1,0,1] -> [0,1,2]
-                # prob[:,0]=P(-1), prob[:,1]=P(0), prob[:,2]=P(1)
-                fold_probs.append(prob)
-                fold_true.append(yb.numpy())
+    # Test inference
+    model.eval()
+    with torch.no_grad():
+        xt = torch.tensor(Xte_seq, dtype=torch.float32, device=device)
+        logits = model(xt).cpu().numpy()
+        probs = softmax(logits, axis=1)
+        y_pred_idx = np.argmax(probs, axis=1)
+        y_pred = y_pred_idx - 1
+        y_true = yte_seq
 
-        fold_probs = np.vstack(fold_probs)
-        fold_true = np.hstack(fold_true)
-        # Align test indices (sequence reduces length by seq_len-1)
-        te_eff_idx = te_idx[seq_len-1:]
+    print("LSTM Classification Report (Test):")
+    print(classification_report(y_true, y_pred, digits=4))
+    print("Confusion Matrix (rows true [-1,0,1], cols pred [-1,0,1]):")
+    print(confusion_matrix(y_true, y_pred, labels=[-1,0,1]))
 
-        # Metrics (classification)
-        y_pred = np.argmax(fold_probs, axis=1)
-        # convert y_pred idx back to class labels [-1,0,1]
-        idx_to_class = {0:-1, 1:0, 2:1}
-        y_pred_lab = np.array([idx_to_class[i] for i in y_pred])
-        acc = accuracy_score(fold_true, y_pred_lab)
-        f1m = f1_score(fold_true, y_pred_lab, average="macro")
-        prec = precision_score(fold_true, y_pred_lab, average="macro", zero_division=0)
-        rec = recall_score(fold_true, y_pred_lab, average="macro", zero_division=0)
-        print(f"[Fold {fold_num}] Classification: Acc={acc:.4f} | F1_macro={f1m:.4f} | Prec_macro={prec:.4f} | Rec_macro={rec:.4f}")
-        print("Confusion matrix (rows=true, cols=pred in order [-1,0,1]):")
-        cm = confusion_matrix(fold_true, y_pred_lab, labels=[-1,0,1])
-        print(cm)
-        print(classification_report(fold_true, y_pred_lab, labels=[-1,0,1], digits=4))
+    # TIM + positions
+    C, T, EV = confusion_and_tim(y_true, y_pred)
+    print("Estimated TIM T:\n", T)
+    print(f"Trace(C * T^T)/N ~ Expected unit payoff: {EV:.4f}")
 
-        all_test_idx.append(te_eff_idx)
-        all_test_probs.append(fold_probs)
-        all_test_true.append(fold_true)
+    # Map probs to positions (aligned to test_df indices)
+    prob_full = np.zeros((len(test_df), 3), dtype=float)
+    prob_full[seq_len:, :] = probs
+    raw_positions = []
+    for i in range(len(test_df)):
+        if i < seq_len:
+            raw_positions.append(0.0)
+            continue
+        p_dn, p_flat, p_up = prob_full[i]
+        pos = probs_to_position(prob_up=p_up, prob_dn=p_dn, prob_flat=p_flat, T=T, max_pos=0.5, edge_thresh=0.05)
+        raw_positions.append(pos)
+    positions = pd.Series(raw_positions, index=test_df.index, name='position')
+    positions = smooth_positions(positions, ema_span=30)
 
-    # Concatenate all test predictions
-    all_test_idx = np.concatenate(all_test_idx)
-    all_test_probs = np.vstack(all_test_probs)
-    all_test_true = np.concatenate(all_test_true)
+    # Backtest supervised
+    bt_sup = backtest_signals(test_df, positions, fee_bps=7.5, slippage_bps=1.0, initial_cash=10000.0)
+    print("Supervised Backtest Metrics:")
+    for k, v in bt_sup.metrics.items():
+        print(f"  {k}: {v:.4f}")
+    plot_results(test_df['Close'], bt_sup, title="Supervised LSTM+TIM (Safe, Long-Only)", filename="plots_supervised.html")
 
-    # Prepare backtest arrays (aligned)
-    bt_times = df.index.values[all_test_idx]
-    bt_prices = close_all[all_test_idx]
-    bt_vol = pd.Series(close_all).pct_change().rolling(60).std().fillna(method="bfill").values[all_test_idx]
+    # ---------------- RL Stage ----------------
+    # Build probs for env
+    probs_test = np.zeros((len(test_df), 3), dtype=np.float32)
+    probs_test[seq_len:, :] = prob_full[seq_len:, :].astype(np.float32)
 
-    # Backtest
-    print("Running backtest on concatenated test windows...")
-    bt = backtest_minute(
-        times=bt_times,
-        prices=bt_prices,
-        probs=all_test_probs,
-        fee_bps=5.0,
-        risk_per_trade=0.01,
-        vol_est=bt_vol,
-        max_trade_units=0.25,
-        min_lot=0.001,
-        initial_cash=10_000.0
-    )
+    # RL state dim
+    state_dim = X_test.shape[1] + 3 + 1
+    actor = Actor(in_dim=state_dim, hidden=128).to(device)
+    critic = Critic(in_dim=state_dim, hidden=128).to(device)
+    actor_tgt = copy.deepcopy(actor).to(device)
+    critic_tgt = copy.deepcopy(critic).to(device)
+    opt_a = optim.Adam(actor.parameters(), lr=1e-4)
+    opt_c = optim.Adam(critic.parameters(), lr=1e-3)
+    rb = ReplayBuffer(capacity=200_000)
+    gamma = 0.99
+    tau = 0.01
+    batch_size = 256
 
-    # Trading KPIs
-    kpis = kpis_from_equity(bt["equity"], bt_times)
-    print("=== Trading KPIs (Test) ===")
-    for k, v in kpis.items():
-        if isinstance(v, float):
-            print(f"{k}: {v:.6f}")
+    # Supervised guidance action from classifier probabilities
+    a_sl = []
+    for i in range(len(test_df)):
+        if i < seq_len:
+            a_sl.append(0.0)
         else:
-            print(f"{k}: {v}")
+            p_dn, p_flat, p_up = prob_full[i]
+            signed = float(np.clip(p_up - p_dn, -1.0, 1.0))
+            guided = (signed + 1.0) / 2.0  # [0,1]
+            a_sl.append(guided)
+    a_sl = np.array(a_sl, dtype=np.float32)
 
-    # Simple realized trade stats
-    sells = [t for t in bt["trades"] if t["side"] == "SELL" and t["pnl_close"] is not None]
-    if len(sells) > 0:
-        pnl_list = [t["pnl_close"] for t in sells]
-        win_rate = np.mean([1.0 if p > 0 else 0.0 for p in pnl_list])
-        avg_win = np.mean([p for p in pnl_list if p > 0]) if any(p > 0 for p in pnl_list) else 0.0
-        avg_loss = np.mean([abs(p) for p in pnl_list if p < 0]) if any(p < 0 for p in pnl_list) else 0.0
-        print(f"Trades closed: {len(sells)} | WinRate={win_rate:.3f} | AvgWin={avg_win:.2f} | AvgLoss={avg_loss:.2f}")
-    else:
-        print("No closed sells with PnL computed.")
+    # Env
+    env_cfg = RLEnvConfig(fee_bps=7.5, slippage_bps=1.0, risk_penalty=0.0, max_position=1.0)
+    env = TradingEnv(test_df, X_test.astype(np.float32), probs_test.astype(np.float32), initial_cash=10000.0, cfg=env_cfg)
 
-    # Create Plotly/Dash app
-    print("Launching Plotly/Dash single-tab dashboard...")
-    app = init_dash_app(df, all_test_idx, all_test_probs, bt, kpis)
-    # Run server; comment out if running in notebook
-    app.run_server(host="0.0.0.0", port=8050, debug=False)
+    # Walk-forward by day
+    dates = test_df.index.normalize().unique()
+    total_steps_cap = 20_000
+    steps_done = 0
+    episodes = min(len(dates), 30)
+    lambda_start = 0.6
+    lambda_end = 0.15
 
-def init_dash_app(df: pd.DataFrame, test_idx: np.ndarray, test_probs: np.ndarray, bt: dict, kpis: dict):
-    # Extract series for plotting
-    times = df.index.values[test_idx]
-    price = df["Close"].values[test_idx]
+    # Exploration noise
+    def add_noise(a, scale=0.05):
+        return float(np.clip(a + np.random.normal(0, scale), -1.0, 1.0))
 
-    # Probabilities
-    p_dn = test_probs[:, 0]
-    p_neu = test_probs[:, 1]
-    p_up = test_probs[:, 2]
+    for ep in range(episodes):
+        day = dates[ep]
+        idx_mask = (test_df.index.normalize() == day)  # boolean array
+        idxs = np.where(idx_mask)[0]
+        if len(idxs) < (seq_len + 10):
+            continue
+        start = int(idxs[0])
+        end = int(idxs[-1])
+        _ = env.reset(start_idx=start)
+        lam = float(lambda_start + (lambda_end - lambda_start) * (ep / max(1, episodes - 1)))
 
-    # Equity, cash, holdings
-    equity = bt["equity"]
-    cash = bt["cash"]
-    holds = bt["holdings"]
+        for t in range(start, end):
+            s = env._get_state()
+            s_t = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                a_rl = actor(s_t).cpu().numpy()[0,0]
+            a_rl = add_noise(a_rl, scale=0.05)
+            a_super = 2.0 * a_sl[t] - 1.0  # back to [-1,1] for mixing
+            a = (1.0 - lam) * a_rl + lam * a_super
+            s2, r, done = env.step(a)
+            rb.push(s, np.array([a], dtype=np.float32), np.array([r], dtype=np.float32), s2, np.array([done], dtype=np.float32))
 
-    # Markers
-    buy_t, buy_p = bt["buy_markers"]
-    sw_t, sw_p = bt["sell_win_markers"]
-    sl_t, sl_p = bt["sell_lose_markers"]
+            if len(rb) >= batch_size:
+                s_b, a_b, r_b, s2_b, d_b = rb.sample(batch_size)
+                s_b = torch.tensor(s_b, dtype=torch.float32, device=device)
+                a_b = torch.tensor(a_b, dtype=torch.float32, device=device)
+                r_b = torch.tensor(r_b, dtype=torch.float32, device=device)
+                s2_b = torch.tensor(s2_b, dtype=torch.float32, device=device)
+                d_b = torch.tensor(d_b, dtype=torch.float32, device=device)
 
-    # Figure 1: Price with trades
-    fig_price = go.Figure()
-    fig_price.add_trace(go.Scatter(x=times, y=price, mode="lines", name="BTC Close", line=dict(color="royalblue")))
-    if len(buy_t) > 0:
-        fig_price.add_trace(go.Scatter(x=buy_t, y=buy_p, mode="markers", name="BUY", marker=dict(color="green", symbol="triangle-up", size=8)))
-    if len(sw_t) > 0:
-        fig_price.add_trace(go.Scatter(x=sw_t, y=sw_p, mode="markers", name="SELL-win", marker=dict(color="limegreen", symbol="x", size=8)))
-    if len(sl_t) > 0:
-        fig_price.add_trace(go.Scatter(x=sl_t, y=sl_p, mode="markers", name="SELL-lose", marker=dict(color="red", symbol="x", size=8)))
-    fig_price.update_layout(title="BTC Price with Trades (BUY, SELL-win, SELL-lose)", legend=dict(orientation="h"))
+                with torch.no_grad():
+                    a2 = actor_tgt(s2_b)
+                    q2 = critic_tgt(s2_b, a2)
+                    y = r_b + gamma * (1.0 - d_b) * q2
 
-    # Figure 2: Portfolio value
-    fig_equity = go.Figure()
-    fig_equity.add_trace(go.Scatter(x=times, y=equity, mode="lines", name="Equity", line=dict(color="black")))
-    fig_equity.update_layout(title="Portfolio Value (Equity)")
+                q1 = critic(s_b, a_b)
+                loss_c = nn.MSELoss()(q1, y)
+                opt_c.zero_grad()
+                loss_c.backward()
+                nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+                opt_c.step()
 
-    # Figure 3: Cash/credit
-    fig_cash = go.Figure()
-    fig_cash.add_trace(go.Scatter(x=times, y=cash, mode="lines", name="Cash", line=dict(color="orange")))
-    fig_cash.update_layout(title="Cash / Credit Over Time")
+                a_pred = actor(s_b)
+                loss_a = -critic(s_b, a_pred).mean()
+                opt_a.zero_grad()
+                loss_a.backward()
+                nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+                opt_a.step()
 
-    # Figure 4: Holdings
-    fig_hold = go.Figure()
-    fig_hold.add_trace(go.Scatter(x=times, y=holds, mode="lines", name="BTC Holdings", line=dict(color="purple")))
-    fig_hold.update_layout(title="Holdings (BTC) Over Time")
+                soft_update(actor_tgt, actor, tau=tau)
+                soft_update(critic_tgt, critic, tau=tau)
 
-    # Figure 5: Predicted Probabilities
-    fig_prob = go.Figure()
-    fig_prob.add_trace(go.Scatter(x=times, y=p_up, mode="lines", name="P(Up)", line=dict(color="green")))
-    fig_prob.add_trace(go.Scatter(x=times, y=p_neu, mode="lines", name="P(Neutral)", line=dict(color="gray")))
-    fig_prob.add_trace(go.Scatter(x=times, y=p_dn, mode="lines", name="P(Down)", line=dict(color="red")))
-    fig_prob.update_layout(title="Predicted Class Probabilities")
+            steps_done += 1
+            if steps_done >= total_steps_cap:
+                break
+        print(f"Episode {ep+1}/{episodes} finished. lambda={lam:.3f}, steps={steps_done}")
+        if steps_done >= total_steps_cap:
+            break
 
-    # Figure 6: KPI Table
-    kpi_table = go.Figure(data=[go.Table(
-        header=dict(values=list(kpis.keys()), fill_color='paleturquoise', align='left'),
-        cells=dict(values=[[f"{kpis[k]:.6f}" if isinstance(kpis[k], float) else str(kpis[k])] for k in kpis.keys()],
-                   fill_color='lavender',
-                   align='left'))
-    ])
-    kpi_table.update_layout(title="Trading KPIs")
+    # Evaluate RL-guided policy
+    env.reset(start_idx=0)
+    positions_rl = []
+    for t in tqdm(range(len(test_df)), desc="RL Evaluation", leave=False):
+        s = env._get_state()
+        s_t = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+        with torch.no_grad():
+            a_rl = actor(s_t).cpu().numpy()[0,0]
+        a_super = 2.0 * a_sl[t] - 1.0
+        a = (1.0 - lambda_end) * a_rl + lambda_end * a_super
+        s2, r, done = env.step(a)
+        positions_rl.append(float(np.clip((a + 1.0) / 2.0, 0.0, 1.0)))
+        if done:
+            break
+    positions_rl = pd.Series(positions_rl, index=test_df.index[:len(positions_rl)], name='position')
+    positions_rl = smooth_positions(positions_rl, ema_span=30)
 
-    app = dash.Dash(__name__)
-    app.layout = html.Div([
-        html.H2("Supervised Trading Model: LSTM + Walk-Forward (Single Tab, Separate Figures)"),
-        html.Div(children=[
-            dcc.Graph(figure=fig_price),
-            dcc.Graph(figure=fig_equity),
-            dcc.Graph(figure=fig_cash),
-            dcc.Graph(figure=fig_hold),
-            dcc.Graph(figure=fig_prob),
-            dcc.Graph(figure=kpi_table),
-        ])
-    ])
-    return app
+    bt_rl = backtest_signals(test_df.iloc[:len(positions_rl)], positions_rl, fee_bps=7.5, slippage_bps=1.0, initial_cash=10000.0)
+    print("RL-Guided Backtest Metrics:")
+    for k, v in bt_rl.metrics.items():
+        print(f"  {k}: {v:.4f}")
+    plot_results(test_df['Close'].iloc[:len(positions_rl)], bt_rl, title="Supervised-Guided DDPG (Safe, Long-Only)", filename="plots_rl.html")
 
 if __name__ == "__main__":
     main()
