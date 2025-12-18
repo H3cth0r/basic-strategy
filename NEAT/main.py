@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 DATA_URL = "https://raw.githubusercontent.com/H3cth0r/stonks-data/refs/heads/main/data/CRYPTO/BTC-USD/data_0.csv"
 
 # Training Settings
-GENERATIONS = 100
+GENERATIONS = 30
 POP_SIZE = 150
 EPISODE_STEPS = 20160  # ~14 Days (2 weeks) to capture full market cycles
 INITIAL_CAPITAL = 10000.0
@@ -207,7 +207,6 @@ def calculate_fitness(env, equity_curve, market_prices):
     market_ret = (market_prices[-1] - market_prices[0]) / market_prices[0]
     
     # Differential Return: (Strategy - Market) / Beta
-    # "Did I beat the market given the risk I took?"
     diff_ret = (total_ret - market_ret) / beta
     
     # Treynor: Return / Beta
@@ -262,6 +261,11 @@ class PeriodicReporter(neat.reporting.BaseReporter):
     def __init__(self, val_data):
         self.val_data = val_data
         self.gen = 0
+        self.best_all_time_roi = -float('inf') # Track all-time best return
+        
+        # Ensure checkpoints directory exists
+        if not os.path.exists("checkpoints"):
+            os.makedirs("checkpoints")
     
     def start_generation(self, generation):
         self.gen = generation
@@ -283,6 +287,18 @@ class PeriodicReporter(neat.reporting.BaseReporter):
             hist_holdings.append(env.holdings * env.closes[i])
             
         roi = (hist_eq[-1] - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+        
+        # --- Save Current Generation Best ---
+        with open(f"checkpoints/gen_{self.gen}_best.pkl", "wb") as f:
+            pickle.dump(best_genome, f)
+            
+        # --- Check for All-Time Best ---
+        if roi > self.best_all_time_roi:
+            self.best_all_time_roi = roi
+            print(f"   >>> NEW ALL-TIME BEST! ROI: {roi:.2f}% (Saved to best_all_time.pkl) <<<")
+            with open("best_all_time.pkl", "wb") as f:
+                pickle.dump(best_genome, f)
+
         print(f"\n[{self.gen}] Best Genome Validation:")
         print(f"   > Equity:   ${hist_eq[-1]:,.2f} ({roi:+.2f}%)")
         print(f"   > Trades:   {len(env.trades)}")
@@ -403,6 +419,33 @@ min_species_size   = 2
     with open('config-neat.txt', 'w') as f: f.write(conf)
     return 'config-neat.txt'
 
+def test_genome(genome, config, test_data, label):
+    """Helper to run a test on a specific genome"""
+    print(f"\n--- Testing {label} ---")
+    net = neat.nn.RecurrentNetwork.create(genome, config)
+    env = TradingEnv(test_data)
+    
+    hist_eq, hist_cash, hist_holdings = [], [], []
+    for i in tqdm(range(len(test_data))):
+        inputs = env.get_state(i)
+        action = net.activate(inputs)
+        eq = env.step(i, action)
+        hist_eq.append(eq)
+        hist_cash.append(env.cash)
+        hist_holdings.append(env.holdings * env.closes[i])
+        
+    final_roi = (hist_eq[-1] - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+    print(f"Final ROI ({label}): {final_roi:.2f}%")
+    print(f"Total Trades: {len(env.trades)}")
+    
+    # Save Plot
+    reporter = PeriodicReporter(test_data)
+    # We slightly hack the plot filename inside the plot function via title or just rename it manually here
+    # Ideally modify plot method to accept filename, but trying to keep code similar
+    reporter.gen = label 
+    reporter.plot(env, hist_eq, hist_cash, hist_holdings)
+    return final_roi
+
 if __name__ == "__main__":
     train, test = load_data()
     if train is not None:
@@ -422,23 +465,33 @@ if __name__ == "__main__":
         print("Training Simplified Swing Trader...")
         winner = p.run(eval_genomes, GENERATIONS)
         
-        with open("winner.pkl", "wb") as f:
+        # Save Last Winner
+        with open("last_winner.pkl", "wb") as f:
             pickle.dump(winner, f)
 
-        # Final Test
-        print("Running Final Test...")
-        net = neat.nn.RecurrentNetwork.create(winner, config)
-        env = TradingEnv(test)
-        
-        hist_eq, hist_cash, hist_holdings = [], [], []
-        for i in tqdm(range(len(test))):
-            inputs = env.get_state(i)
-            action = net.activate(inputs)
-            eq = env.step(i, action)
-            hist_eq.append(eq)
-            hist_cash.append(env.cash)
-            hist_holdings.append(env.holdings * env.closes[i])
+        print("\n" + "="*50)
+        print("COMPARATIVE FINAL TEST")
+        print("="*50)
+
+        # 1. Test Last Generation Winner
+        roi_last = test_genome(winner, config, test, "Last_Winner")
+
+        # 2. Test All-Time Best (if exists)
+        if os.path.exists("best_all_time.pkl"):
+            with open("best_all_time.pkl", "rb") as f:
+                best_all_time = pickle.load(f)
+            roi_best = test_genome(best_all_time, config, test, "All_Time_Best")
             
-        reporter = PeriodicReporter(test)
-        reporter.plot(env, hist_eq, hist_cash, hist_holdings)
+            print("\n" + "="*50)
+            print(f"COMPARISON RESULT:")
+            print(f"Last Winner ROI:   {roi_last:.2f}%")
+            print(f"All-Time Best ROI: {roi_best:.2f}%")
+            if roi_best > roi_last:
+                print(">> The All-Time Best genome performed better.")
+            else:
+                print(">> The Last Generation winner performed better.")
+            print("="*50)
+        else:
+            print("No 'best_all_time.pkl' found (maybe no positive ROI?).")
+
         print("Done.")
